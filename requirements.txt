@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+numpy
+opencv-python
+mediapipe
+reportlab
+python-multipart
+boto3
