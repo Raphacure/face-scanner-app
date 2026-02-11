@@ -64,21 +64,21 @@ def process_video_frames(frame, scan_id):
 
     clear(scan_id)
 
-    filename = f"/tmp/report_{scan_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
+    # filename = f"/tmp/report_{scan_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
 
-    user = {
-        "name": "Dileep",
-        "age": 25,
-        "gender": "Male"
-    }
+    # user = {
+    #     "name": "Dileep",
+    #     "age": 25,
+    #     "gender": "Male"
+    # }
 
-    generate_health_report(user, data, filename)
-    report_url = upload_pdf_to_s3(filename)
+    # generate_health_report(user, data, filename)
+    # report_url = upload_pdf_to_s3(filename)
 
-    if os.path.exists(filename):
-        os.remove(filename)
+    # if os.path.exists(filename):
+    #     os.remove(filename)
 
-    send_whatsapp_pdf("917337529401", report_url)
+    # send_whatsapp_pdf("917337529401", report_url)
 
     # ✅ Force memory cleanup (IMPORTANT FOR EC2)
     del frames
@@ -89,5 +89,5 @@ def process_video_frames(frame, scan_id):
         "status": "success",
         "quality": quality,
         "data": data,
-        "reportUrl": report_url
+        # "reportUrl": report_url
     }
