@@ -4,7 +4,7 @@ import time
 BUFFERS = defaultdict(list)
 TIMESTAMPS = {}
 
-MAX_FRAMES = 300
+MAX_FRAMES = 100
 TIMEOUT_SECONDS = 30
 
 

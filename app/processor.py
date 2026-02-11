@@ -1,25 +1,37 @@
-from datetime import datetime
+import os
+os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"   # ✅ FIRST LINE
+
 import cv2
 import mediapipe as mp
+
+from datetime import datetime
+
+import gc
+import os
+
 from app.core.frame_buffer import add_frame, is_ready, get_frames, clear, count
 from app.core.aggregator import calculate_all
 from app.quality.quality_aggregator import evaluate_scan_quality
-
 from app.pdf.report_generator import generate_health_report
 from app.aws.s3_uploader import upload_pdf_to_s3
-import os
 from app.whatsapp.send_whatsapp import send_whatsapp_pdf
 
 
-mp_face = mp.solutions.face_detection
-face_detector = mp_face.FaceDetection()
+def get_face_detector():
+    return mp.solutions.face_detection.FaceDetection(
+        model_selection=0,
+        min_detection_confidence=0.5
+    )
 
 
 def process_video_frames(frame, scan_id):
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    detector = get_face_detector()
 
-    results = face_detector.process(rgb)
+    small = cv2.resize(frame, (320, 240))   # ✅ CRITICAL FIX
+    rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+
+    results = detector.process(rgb)
 
     if not results.detections:
         return {
@@ -27,24 +39,19 @@ def process_video_frames(frame, scan_id):
             "message": "No face detected"
         }
 
-    # ✅ Add frame to buffer
     add_frame(scan_id, rgb)
 
-    # ✅ Still collecting frames
     if not is_ready(scan_id):
         return {
             "status": "processing",
             "message": f"Collecting frames {count(scan_id)}/300"
         }
 
-    # ✅ Scan Complete: Process all frames
     frames = get_frames(scan_id)
 
     quality = evaluate_scan_quality(frames)
     data = calculate_all(frames)
 
-
-    # ✅ Reduce confidence based on quality
     if quality["level"] == "Low":
         for group in data.values():
             for metric in group.values():
@@ -55,14 +62,8 @@ def process_video_frames(frame, scan_id):
             for metric in group.values():
                 metric["confidence"] *= 0.8
 
-    # ✅ Clear memory buffer
     clear(scan_id)
 
-    # -------------------------------------------------
-    # ✅ AUTO GENERATE PDF REPORT + UPLOAD TO S3
-    # -------------------------------------------------
-
-    # Temporary local file
     filename = f"/tmp/report_{scan_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
 
     user = {
@@ -71,25 +72,22 @@ def process_video_frames(frame, scan_id):
         "gender": "Male"
     }
 
-    # ✅ Generate PDF
     generate_health_report(user, data, filename)
-
-    # ✅ Upload to AWS S3
     report_url = upload_pdf_to_s3(filename)
 
-    # ✅ Delete local file after upload
     if os.path.exists(filename):
         os.remove(filename)
 
-    # -------------------------------------------------
-    # ✅ FINAL RESPONSE
-    # -------------------------------------------------
+    send_whatsapp_pdf("917337529401", report_url)
 
-    # sending whats report
-    send_whatsapp_pdf("917337529401",report_url)
+    # ✅ Force memory cleanup (IMPORTANT FOR EC2)
+    del frames
+    del rgb
+    gc.collect()
+
     return {
         "status": "success",
         "quality": quality,
         "data": data,
-        "reportUrl": report_url   # ✅ Important
+        "reportUrl": report_url
     }
