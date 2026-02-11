@@ -1,5 +1,8 @@
 import os
+
+# ✅ MUST be before mediapipe import
 os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 import cv2
 import mediapipe as mp
@@ -9,7 +12,8 @@ from app.core.frame_buffer import add_frame, is_ready, get_frames, clear, count
 from app.core.aggregator import calculate_all
 from app.quality.quality_aggregator import evaluate_scan_quality
 
-# ✅ Create ONCE (GLOBAL / PER WORKER)
+
+# ✅ Create ONCE per worker (GOOD — keep this)
 mp_face = mp.solutions.face_detection
 face_detector = mp_face.FaceDetection(
     model_selection=0,
@@ -19,7 +23,9 @@ face_detector = mp_face.FaceDetection(
 
 def process_video_frames(frame, scan_id):
 
-    small = cv2.resize(frame, (320, 240))   # ✅ Huge memory reduction
+    # ✅ Resize FIRST → huge CPU & RAM savings
+    small = cv2.resize(frame, (320, 240))
+
     rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
 
     results = face_detector.process(rgb)
@@ -45,7 +51,7 @@ def process_video_frames(frame, scan_id):
 
     clear(scan_id)
 
-    # ✅ Critical cleanup
+    # ✅ Strong cleanup (important for long-running workers)
     del frames
     del rgb
     del small
