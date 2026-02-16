@@ -14,7 +14,7 @@ from app.core.aggregator import calculate_all
 from app.quality.quality_aggregator import evaluate_scan_quality
 from app.pdf.report_generator import generate_health_report
 from app.aws.s3_uploader import upload_pdf_to_s3
-# from app.whatsapp.send_whatsapp import send_whatsapp_pdf
+from app.whatsapp.send_whatsapp import send_whatsapp_pdf
 
 
 # ✅ Create ONCE per worker
@@ -74,7 +74,7 @@ def process_video_frames(frame, scan_id):
     del small
     gc.collect()
 
-    # send_whatsapp_pdf("917337529401", report_url)
+    send_whatsapp_pdf("917337529401", report_url)
 
     return {
         "status": "success",
