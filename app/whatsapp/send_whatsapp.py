@@ -25,8 +25,8 @@ def send_whatsapp_pdf(to: str, pdf_url: str):
         "type": "document",
         "document": {
             "link": pdf_url,
-            "caption": "Here is your report.",
-            "filename": "Health_Report.pdf"
+            "caption": "Here is your face scan report.",
+            "filename": "Face_Scan_Report.pdf"
         }
     }
 

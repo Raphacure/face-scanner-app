@@ -12,7 +12,8 @@ router = APIRouter()
 @router.post("/analyze")
 async def analyze(
     frames: List[UploadFile] = File(...),
-    scanId: str = Form(...)
+    scanId: str = Form(...),
+    userId: str = Form(...),
 ):
     final_response = None
 
@@ -29,7 +30,7 @@ async def analyze(
             if image is None:
                 continue
 
-            response = process_video_frames(image, scanId)
+            response = process_video_frames(image, scanId, userId)
             final_response = response
 
             # ✅ Stop immediately if scan finished

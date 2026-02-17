@@ -25,7 +25,7 @@ face_detector = mp_face.FaceDetection(
 )
 
 
-def process_video_frames(frame, scan_id):
+def process_video_frames(frame, scan_id, userId):
 
     # ✅ Resize FIRST → huge CPU & RAM savings
     small = cv2.resize(frame, (320, 240))
@@ -44,7 +44,7 @@ def process_video_frames(frame, scan_id):
     if not is_ready(scan_id):
         return {
             "status": "processing",
-            "message": f"Collecting frames {count(scan_id)}/300"
+            "message": f"Collecting frames {count(scan_id)}/100"
         }
 
     frames = get_frames(scan_id)
@@ -55,6 +55,7 @@ def process_video_frames(frame, scan_id):
     clear(scan_id)
 
     filename = f"/tmp/report_{scan_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
+    print("userId", userId)
 
     user = {
         "name": "Dileep",
