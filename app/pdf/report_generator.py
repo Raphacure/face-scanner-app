@@ -6,7 +6,7 @@ from reportlab.platypus import (
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from datetime import datetime
-
+import requests
 
 # ==========================================================
 # ✅ NESTED METRIC GETTER
@@ -360,18 +360,22 @@ def generate_health_report(user, metrics, filename):
 
     return filename
 
-
-# ==========================================================
-# ✅ EXAMPLE USAGE
-# ==========================================================
-if __name__ == "__main__":
-
-    user = {
-        "name": "Dileep",
-        "gender": "Male",
-        "age": 26
+def get_user_details(user_id):
+    url = "https://api.raphacure.com/api/v1/user/user-details"
+    
+    headers = {
+        "x-microservice-id": "RaphaCure_Microservice"
     }
+    
+    params = {
+        "user_id": user_id
+    }
+    
+    response = requests.get(url, headers=headers, params=params)
 
-    # metrics = your API response
-    generate_health_report(user, metrics, "assessment_report.pdf")
-    print("PDF Generated Successfully!")
+
+    
+    # Raise exception for bad responses (4xx / 5xx)
+    response.raise_for_status()
+    
+    return response.json()["data"]

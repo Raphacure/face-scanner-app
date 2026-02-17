@@ -1,3 +1,4 @@
+from ast import If
 import os
 import gc
 from datetime import datetime
@@ -12,7 +13,7 @@ import mediapipe as mp
 from app.core.frame_buffer import add_frame, is_ready, get_frames, clear, count
 from app.core.aggregator import calculate_all
 from app.quality.quality_aggregator import evaluate_scan_quality
-from app.pdf.report_generator import generate_health_report
+from app.pdf.report_generator import generate_health_report, get_user_details
 from app.aws.s3_uploader import upload_pdf_to_s3
 from app.whatsapp.send_whatsapp import send_whatsapp_pdf
 
@@ -57,12 +58,35 @@ def process_video_frames(frame, scan_id, userId):
     filename = f"/tmp/report_{scan_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
     print("userId", userId)
 
+
+    try:
+        user_details = get_user_details(userId)
+    except Exception as e:
+        print("error", e)
+        user_details = None
+
+    users = user_details.get("user", []) if user_details else []
+    userobj = users[0] if users else {}
+
+    first_name = userobj.get("first_name")
+    last_name = userobj.get("last_name")
+
     user = {
-        "name": "Dileep",
-        "age": 25,
-        "gender": "Male"
+    "name": f"{first_name} {last_name}" if first_name and last_name else "N/A",
+    "age": userobj.get("age") if userobj.get("age") is not None else "N/A",
+    "gender": userobj.get("gender") if userobj.get("gender") else "N/A",
     }
 
+    raw_phone = userobj.get("phone")
+
+    phone = None
+    if raw_phone :
+        phone = f"91{raw_phone}"
+
+    print("phone number", phone)
+
+
+   
     generate_health_report(user, data, filename)
     report_url = upload_pdf_to_s3(filename)
 
@@ -75,7 +99,9 @@ def process_video_frames(frame, scan_id, userId):
     del small
     gc.collect()
 
-    send_whatsapp_pdf("917337529401", report_url)
+
+    if phone:
+        send_whatsapp_pdf("917337529401", report_url)
 
     return {
         "status": "success",

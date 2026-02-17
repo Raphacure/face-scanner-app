@@ -57,7 +57,6 @@ def calculate_all(frames):
         "results": {}
     }
 
-    print("Calculating all metrics")
 
     flat_results = {}
 
@@ -71,7 +70,6 @@ def calculate_all(frames):
     # 2️⃣ Run skin aggregation ONCE
     flat_results["skin"] = calculate_skin_health(context)
 
-    print("Calculated skin health")
 
     # 3️⃣ Group final response
     return group_metrics(flat_results)

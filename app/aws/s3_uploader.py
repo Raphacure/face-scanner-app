@@ -24,12 +24,6 @@ def upload_pdf_to_s3(file_path):
     )
 
     filename = os.path.basename(file_path)
-    print("filename", filename)
-    print("file_path", file_path)
-    print("BUCKET_NAME", BUCKET_NAME)
-    print("AWS_REGION", AWS_REGION)
-    print("AWS_ACCESS_KEY", AWS_ACCESS_KEY)
-    print("AWS_SECRET_KEY", AWS_SECRET_KEY)
 
     # Upload file
     s3.upload_file(
