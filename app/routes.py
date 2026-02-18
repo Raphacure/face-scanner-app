@@ -1,3 +1,4 @@
+from app.core.frame_buffer import clear
 from fastapi import APIRouter, UploadFile, File, Form
 from typing import List
 import cv2
@@ -55,3 +56,14 @@ async def analyze(
         "status": "processing",
         "message": "Collecting frames"
     }
+
+@router.post("/cancel-scan")
+def cancel_scan(payload: dict):
+    scan_id = payload.get("scanId")
+
+    if not scan_id:
+        return {"status": "error", "message": "scanId missing"}
+
+    clear(scan_id)
+
+    return {"status": "cancelled"}
