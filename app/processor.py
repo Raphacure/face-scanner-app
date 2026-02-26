@@ -45,7 +45,8 @@ def process_video_frames(frame, scan_id, userId):
     if not is_ready(scan_id):
         return {
             "status": "processing",
-            "message": f"Collecting frames {count(scan_id)}/100"
+            "message": f"Collecting frames {count(scan_id)}/100",
+            "count":count(scan_id)
         }
 
     frames = get_frames(scan_id)
