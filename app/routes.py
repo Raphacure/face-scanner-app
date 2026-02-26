@@ -1,5 +1,5 @@
 from app.core.frame_buffer import clear
-from fastapi import APIRouter, UploadFile, File, Form
+from fastapi import APIRouter, UploadFile, File, Form,Request
 from typing import List
 import cv2
 import numpy as np
@@ -12,6 +12,7 @@ router = APIRouter()
 
 @router.post("/analyze")
 async def analyze(
+    request: Request,
     frames: List[UploadFile] = File(...),
     scanId: str = Form(...),
     userId: str = Form(...),
@@ -31,8 +32,9 @@ async def analyze(
             if image is None:
                 continue
 
-            response = process_video_frames(image, scanId, userId)
+            response = process_video_frames(request,image, scanId, userId)
             final_response = response
+            # todo
 
             # ✅ Stop immediately if scan finished
             if response.get("status") == "success":

@@ -13,7 +13,7 @@ import mediapipe as mp
 from app.core.frame_buffer import add_frame, is_ready, get_frames, clear, count
 from app.core.aggregator import calculate_all
 from app.quality.quality_aggregator import evaluate_scan_quality
-from app.pdf.report_generator import generate_health_report, get_user_details
+from app.pdf.report_generator import generate_health_report, get_user_details, insert_face_scan
 from app.aws.s3_uploader import upload_pdf_to_s3
 from app.whatsapp.send_whatsapp import send_whatsapp_pdf
 
@@ -26,7 +26,7 @@ face_detector = mp_face.FaceDetection(
 )
 
 
-def process_video_frames(frame, scan_id, userId):
+def process_video_frames(request,frame, scan_id, userId):
 
     # ✅ Resize FIRST → huge CPU & RAM savings
     small = cv2.resize(frame, (320, 240))
@@ -99,6 +99,41 @@ def process_video_frames(frame, scan_id, userId):
     del rgb
     del small
     gc.collect()
+
+
+    ip_address = request.headers.get("x-forwarded-for")
+    if ip_address:
+        ip_address = ip_address.split(",")[0].strip()
+    else:
+        ip_address = request.client.host
+
+    print("ip_address",ip_address)
+    # ✅ Device detection (basic)
+    user_agent = request.headers.get("user-agent", "").lower()
+
+    if "mobile" in user_agent:
+        device = "mobile"
+    elif "android" in user_agent:
+        device = "android"
+    elif "iphone" in user_agent:
+        device = "iphone"
+    elif "windows" in user_agent or "macintosh" in user_agent:
+        device = "desktop"
+    else:
+        device = "unknown"
+
+    print("device",device)
+
+    faceScanData = {
+        "device": device,
+        "ip": ip_address,
+        "user_id": userId,
+        "report_url": report_url,
+        "response": data
+    }
+
+    insert_face_scan(faceScanData)
+
 
 
     if phone:

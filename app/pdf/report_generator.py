@@ -379,3 +379,35 @@ def get_user_details(user_id):
     response.raise_for_status()
     
     return response.json()["data"]
+
+
+def insert_face_scan(scanData):
+    try:
+        url = "https://api.raphacure.com/api/v1/face-scan"
+
+        headers = {
+            "x-microservice-id": "RaphaCure_Microservice",
+            "Content-Type": "application/json"
+        }
+
+        response = requests.post(
+            url,
+            headers=headers,
+            json=scanData,      # ✅ CORRECT
+            timeout=10          # ✅ Always good practice
+        )
+
+
+        response.raise_for_status()
+
+        return {
+            "status": "success",
+        }
+
+    except requests.exceptions.RequestException as error:
+        print("Face Scan API Error:", error)
+
+        return {
+            "status": "error",
+            "message": "Face scan API request failed"
+        }
