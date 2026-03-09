@@ -116,6 +116,22 @@ DESCRIPTIONS = {
         "Skin health score is an overall indicator combining hydration, texture, "
         "redness, and other facial skin parameters.",
 
+    # ---------------- AYURVEDA DOSHA ----------------
+    "dosha.vata":
+        "Vata represents movement and communication in the body. "
+        "It is associated with the nervous system, breathing, and circulation. "
+        "Balanced Vata supports creativity, flexibility, and vitality.",
+
+    "dosha.pitta":
+        "Pitta represents metabolism and transformation. "
+        "It governs digestion, body temperature, and energy production. "
+        "Balanced Pitta supports focus, determination, and strong digestion.",
+
+    "dosha.kapha":
+        "Kapha represents structure and stability. "
+        "It governs immunity, lubrication of joints, and emotional calmness. "
+        "Balanced Kapha supports endurance, strength, and resilience.",
+
 
     # ---------------- SCORE ----------------
     "scores.wellnessScore":
@@ -286,7 +302,12 @@ def generate_health_report(user, metrics, filename):
             ("Skin Hydration", "skin.skinHydration"),
             ("Dark Circles", "skin.darkCircles"),
             ("Skin Health Score", "skin.skinHealthScore"),
-        ]
+        ],
+        "Ayurveda Dosha Analysis": [
+            ("Vata", "dosha.vata"),
+            ("Pitta", "dosha.pitta"),
+            ("Kapha", "dosha.kapha"),
+        ],
     }
 
     # ==========================================================

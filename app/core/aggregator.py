@@ -22,6 +22,7 @@ from app.modules.wellness import WellnessMetric
 
 from app.skin.skin_aggregator import calculate_skin_health
 from app.core.group_results import group_metrics
+from app.skin.dosha_analysis import calculate_dosha
 
 
 # ✅ METRICS MUST LIVE IN THIS FILE
@@ -69,6 +70,7 @@ def calculate_all(frames):
 
     # 2️⃣ Run skin aggregation ONCE
     flat_results["skin"] = calculate_skin_health(context)
+    flat_results["dosha"] = calculate_dosha(context)
 
 
     # 3️⃣ Group final response

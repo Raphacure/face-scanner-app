@@ -18,5 +18,7 @@ def group_metrics(flat_results):
     # ✅ Add Skin Group Separately (nested object)
     if "skin" in flat_results:
         grouped["skin"] = flat_results["skin"]
+    if "dosha" in flat_results:
+        grouped["dosha"] = flat_results["dosha"]
 
     return grouped
