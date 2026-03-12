@@ -7,7 +7,39 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from datetime import datetime
 import requests
+from reportlab.platypus import Image
+import os
 
+from reportlab.platypus import Flowable
+
+class RoundedImage(Flowable):
+    def __init__(self, img_path, width, height, radius=15):
+        super().__init__()
+        self.img_path = img_path
+        self.width = width
+        self.height = height
+        self.radius = radius
+
+    def draw(self):
+        c = self.canv
+
+        # Create clipping path
+        path = c.beginPath()
+        path.roundRect(0, 0, self.width, self.height, self.radius)
+
+        c.saveState()
+        c.clipPath(path, stroke=0, fill=0)
+
+        c.drawImage(
+            self.img_path,
+            0,
+            0,
+            width=self.width,
+            height=self.height,
+            mask='auto'
+        )
+
+        c.restoreState()
 # ==========================================================
 # ✅ NESTED METRIC GETTER
 # ==========================================================
@@ -239,30 +271,65 @@ def hrv_details_block(metrics):
 # ==========================================================
 # ✅ MAIN PDF REPORT FUNCTION (ALL METRICS)
 # ==========================================================
-def generate_health_report(user, metrics, filename):
+def generate_health_report(user, metrics, filename, image_path=None):
 
     doc = SimpleDocTemplate(filename, pagesize=A4)
     styles = getSampleStyleSheet()
     story = []
 
     # ==========================================================
-    # HEADER
+    # TITLE
     # ==========================================================
     story.append(Paragraph("Assessment Report", styles["Title"]))
-    story.append(Spacer(1, 10))
-
-    story.append(
-        Paragraph(
-            f"<b>Name :</b> {user['name']} &nbsp;&nbsp;&nbsp;"
-            f"<b>Gender :</b> {user['gender']}<br/>"
-            f"<b>Date of assessment :</b> {datetime.now().strftime('%d %b %Y')} "
-            f"&nbsp;&nbsp;&nbsp;<b>Age :</b> {user['age']}",
-            styles["Normal"]
-        )
-    )
-
     story.append(Spacer(1, 25))
 
+    # ----------------------------------------------------------
+    # USER DETAILS
+    # ----------------------------------------------------------
+    user_details = Paragraph(
+        f"""
+        <b>Name :</b> {user['name']}<br/>
+        <b>Gender :</b> {user['gender']}<br/>
+        <b>Date of assessment :</b> {datetime.now().strftime('%d %b %Y')}<br/>
+        <b>Age :</b> {user['age']}
+        """,
+        styles["Normal"]
+    )
+
+    # ----------------------------------------------------------
+    # PROFILE IMAGE
+    # ----------------------------------------------------------
+    profile_image = ""
+
+    if image_path and os.path.exists(image_path):
+        try:
+            profile_image = RoundedImage(image_path, width=140, height=110, radius=15)
+        except:
+            profile_image = ""
+
+    # ----------------------------------------------------------
+    # HEADER TABLE
+    # ----------------------------------------------------------
+    header_table = Table(
+        [
+            ["", user_details, profile_image]
+        ],
+        colWidths=[360, 200]  
+    )
+    header_table.hAlign = "RIGHT"
+
+    header_table.setStyle(
+        TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ])
+    )
+
+    story.append(header_table)
+    story.append(Spacer(1, 25))
     # ==========================================================
     # ALL SECTIONS + ALL METRICS
     # ==========================================================
@@ -296,13 +363,15 @@ def generate_health_report(user, metrics, filename):
             ("Motion Stability", "behavior.motionStability"),
             ("Alertness", "behavior.alertness"),
         ],
-         "Skin Health": [
+
+        "Skin Health": [
             ("Skin Redness", "skin.skinRedness"),
             ("Skin Texture", "skin.skinTexture"),
             ("Skin Hydration", "skin.skinHydration"),
             ("Dark Circles", "skin.darkCircles"),
             ("Skin Health Score", "skin.skinHealthScore"),
         ],
+
         "Ayurveda Dosha Analysis": [
             ("Vata", "dosha.vata"),
             ("Pitta", "dosha.pitta"),
@@ -311,7 +380,7 @@ def generate_health_report(user, metrics, filename):
     }
 
     # ==========================================================
-    # PRINT EVERYTHING AUTOMATICALLY
+    # PRINT METRICS
     # ==========================================================
     for section_name, metrics_list in sections.items():
 
@@ -320,12 +389,11 @@ def generate_health_report(user, metrics, filename):
         for title, path in metrics_list:
             story.append(metric_block(title, metrics, path))
 
-        # Add HRV Details Table after Heart Health
         if section_name == "Heart Health":
             story.append(hrv_details_block(metrics))
 
     # ==========================================================
-    # RECOMMENDATION (Same PDF Text)
+    # RECOMMENDATION
     # ==========================================================
     story.append(section_title("Recommendation", styles))
 
@@ -360,7 +428,7 @@ def generate_health_report(user, metrics, filename):
     )
 
     # ==========================================================
-    # DISCLAIMER (Same PDF Text)
+    # DISCLAIMER
     # ==========================================================
     story.append(section_title("Disclaimer", styles))
 
