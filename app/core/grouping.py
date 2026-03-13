@@ -19,12 +19,12 @@ GROUP_MAP = {
         "relaxationScore"
     ],
 
-    "behavior": [
-        "blinkRate",
-        "eyeClosureDuration",
-        "motionStability",
-        "alertness"
-    ],
+    # "behavior": [
+    #     "blinkRate",
+    #     "eyeClosureDuration",
+    #     "motionStability",
+    #     "alertness"
+    # ],
     "skin": [
         "skin"
     ],

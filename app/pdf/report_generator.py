@@ -111,21 +111,21 @@ DESCRIPTIONS = {
 
 
     # ---------------- BEHAVIOR ----------------
-    "behavior.blinkRate":
-        "Blink rate is the number of times you blink per minute. "
-        "An increased blink rate may indicate stress, fatigue, or eye strain.",
+    # "behavior.blinkRate":
+    #     "Blink rate is the number of times you blink per minute. "
+    #     "An increased blink rate may indicate stress, fatigue, or eye strain.",
 
-    "behavior.eyeClosureDuration":
-        "Eye closure duration represents the average time your eyes remain closed. "
-        "Longer closures may reflect tiredness or reduced alertness.",
+    # "behavior.eyeClosureDuration":
+    #     "Eye closure duration represents the average time your eyes remain closed. "
+    #     "Longer closures may reflect tiredness or reduced alertness.",
 
-    "behavior.motionStability":
-        "Motion stability measures how steady you remained during the scan. "
-        "Higher stability improves scan accuracy.",
+    # "behavior.motionStability":
+    #     "Motion stability measures how steady you remained during the scan. "
+    #     "Higher stability improves scan accuracy.",
 
-    "behavior.alertness":
-        "Alertness score reflects cognitive readiness and attentiveness. "
-        "Higher alertness indicates better focus and awareness.",
+    # "behavior.alertness":
+    #     "Alertness score reflects cognitive readiness and attentiveness. "
+    #     "Higher alertness indicates better focus and awareness.",
 
         # ---------------- SKIN HEALTH ----------------
     "skin.skinRedness":
@@ -357,12 +357,12 @@ def generate_health_report(user, metrics, filename, image_path=None):
             ("Relaxation Score", "mental.relaxationScore"),
         ],
 
-        "Behavior Metrics": [
-            ("Blink Rate", "behavior.blinkRate"),
-            ("Eye Closure Duration", "behavior.eyeClosureDuration"),
-            ("Motion Stability", "behavior.motionStability"),
-            ("Alertness", "behavior.alertness"),
-        ],
+        # "Behavior Metrics": [
+        #     ("Blink Rate", "behavior.blinkRate"),
+        #     ("Eye Closure Duration", "behavior.eyeClosureDuration"),
+        #     ("Motion Stability", "behavior.motionStability"),
+        #     ("Alertness", "behavior.alertness"),
+        # ],
 
         "Skin Health": [
             ("Skin Redness", "skin.skinRedness"),

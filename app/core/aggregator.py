@@ -34,12 +34,12 @@ METRICS = [
     SpO2Metric(),
     StressMetric(),
 
-    BlinkRateMetric(),
-    EyeClosureMetric(),
-    MotionStabilityMetric(),
+    # BlinkRateMetric(),
+    # EyeClosureMetric(),
+    # MotionStabilityMetric(),
 
     FatigueMetric(),
-    AlertnessMetric(),
+    # AlertnessMetric(),
 
     PulseRegularityMetric(),
     CardiacWorkloadMetric(),
