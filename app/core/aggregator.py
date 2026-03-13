@@ -17,12 +17,14 @@ from app.modules.cardiac_workload import CardiacWorkloadMetric
 from app.modules.breathing_stability import BreathingStabilityMetric
 from app.modules.relaxation import RelaxationMetric
 from app.modules.recovery import RecoveryIndexMetric
+from app.modules.biological_age import BiologicalAge
 
 from app.modules.wellness import WellnessMetric
 
 from app.skin.skin_aggregator import calculate_skin_health
 from app.core.group_results import group_metrics
 from app.skin.dosha_analysis import calculate_dosha
+
 
 
 # ✅ METRICS MUST LIVE IN THIS FILE
@@ -47,31 +49,35 @@ METRICS = [
     RelaxationMetric(),
     RecoveryIndexMetric(),
 
-    WellnessMetric()
+    WellnessMetric(),
+    BiologicalAge()
 ]
 
 
-def calculate_all(frames):
+def calculate_all(frames,user):
     context = {
         "frames": frames,
         "fps": 30,
-        "results": {}
+        "results": {},
+        "user":user
     }
 
 
     flat_results = {}
 
-    # 1️⃣ Run all metric modules
+    flat_results["skin"] = calculate_skin_health(context)
+    context["results"]["skin"] = flat_results["skin"]
+
     for metric in METRICS:
         print("Calculating metric", metric.name)
         value = metric.calculate(context)
         flat_results[metric.name] = value
         context["results"][metric.name] = value
 
-    # 2️⃣ Run skin aggregation ONCE
-    flat_results["skin"] = calculate_skin_health(context)
     flat_results["dosha"] = calculate_dosha(context)
 
 
-    # 3️⃣ Group final response
+    print("flat_results",flat_results)
+
+
     return group_metrics(flat_results)

@@ -7,7 +7,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from datetime import datetime
 import requests
-from reportlab.platypus import Image
+from reportlab.platypus import Image    
 import os
 
 from reportlab.platypus import Flowable
@@ -110,6 +110,10 @@ DESCRIPTIONS = {
         "Higher values suggest better relaxation and parasympathetic activity.",
 
 
+    "biological_age.biologicalAge":
+        "Biological age represents how well your body is functioning compared to typical aging patterns."
+        "It is estimated using physiological indicators such as cardiovascular health, stress, and recovery signals.",
+       
     # ---------------- BEHAVIOR ----------------
     # "behavior.blinkRate":
     #     "Blink rate is the number of times you blink per minute. "
@@ -376,6 +380,10 @@ def generate_health_report(user, metrics, filename, image_path=None):
             ("Vata", "dosha.vata"),
             ("Pitta", "dosha.pitta"),
             ("Kapha", "dosha.kapha"),
+        ],
+
+        "Biological Age": [
+            ("Biological Age", "biological_age.biologicalAge"),
         ],
     }
 

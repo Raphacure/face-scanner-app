@@ -50,7 +50,7 @@ def process_video_frames(request, frame, scan_id, userId):
     frames = get_frames(scan_id)
 
     quality = evaluate_scan_quality(frames)
-    data = calculate_all(frames)
+
 
     clear(scan_id)
 
@@ -84,7 +84,7 @@ def process_video_frames(request, frame, scan_id, userId):
 
         user = {
             "name": f"{first_name} {last_name}" if first_name and last_name else "N/A",
-            "age": userobj.get("age") if userobj.get("age") is not None else "N/A",
+            "age": userobj.get("age") if userobj.get("age") is not None else '',
             "gender": userobj.get("gender") if userobj.get("gender") else "N/A",
         }
 
@@ -96,6 +96,7 @@ def process_video_frames(request, frame, scan_id, userId):
 
         print("phone number", phone)
 
+        data = calculate_all(frames,user)
         # --------------------------------------------------
         # GENERATE PDF WITH IMAGE
         # --------------------------------------------------

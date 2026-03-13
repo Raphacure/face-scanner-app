@@ -28,6 +28,7 @@ GROUP_MAP = {
     "skin": [
         "skin"
     ],
+    "biological_age":["biologicalAge"],
     "scores": [
         "wellnessScore"
     ]

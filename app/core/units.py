@@ -12,5 +12,6 @@ UNITS = {
     "wellnessScore": "%",
     "blinkRate": "blinks/min",
     "eyeClosureDuration": "seconds",
-    "motionStability": "%"
+    "motionStability": "%",
+    "biologicalAge":"years"
 }
