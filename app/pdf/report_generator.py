@@ -742,11 +742,14 @@ def generate_health_report_v2(
     date_txt = datetime.now().strftime("%b %-d , %Y") if os.name != "nt" else datetime.now().strftime("%b %d , %Y")
 
     # Left side: report title, name, and demographic line stacked vertically
+    bio_age = get_metric(metrics, "biological_age.biologicalAge", "value", default="N/A")
+
     left_header_block = Table(
         [
             [Paragraph("HEALTH ASSESSMENT REPORT", tiny_style)],
             [Paragraph(name if name != "N/A" else "My Self", h1_style)],
             [Paragraph(f"{gender.title()} • Age {age} • {date_txt}".strip(" •"), sub_style)],
+            [Paragraph(f"Biological Age {bio_age}".strip(), sub_style)],
         ],
         colWidths=[6.0 * inch],
     )

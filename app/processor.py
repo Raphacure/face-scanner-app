@@ -7,6 +7,8 @@ from datetime import datetime
 os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
+from app.services.send_email import send_email
+from app.services.send_whatsapp import send_whatsapp_pdf
 import cv2
 import mediapipe as mp
 
@@ -15,7 +17,6 @@ from app.core.aggregator import calculate_all
 from app.quality.quality_aggregator import evaluate_scan_quality
 from app.pdf.report_generator import generate_health_report, generate_health_report_v2, get_user_details, insert_face_scan
 from app.aws.s3_uploader import upload_image_to_s3, upload_pdf_to_s3
-from app.whatsapp.send_whatsapp import send_whatsapp_pdf
 
 
 # ✅ Create ONCE per worker
@@ -89,6 +90,7 @@ def process_video_frames(request, frame, scan_id, userId):
             "gender": userobj.get("gender") if userobj.get("gender") else "N/A",
         }
 
+        email = userobj.get("email")
         raw_phone = userobj.get("phone")
 
         phone = None
@@ -149,6 +151,20 @@ def process_video_frames(request, frame, scan_id, userId):
         # Send WhatsApp
         if phone:
             send_whatsapp_pdf(phone, report_url, report_v2_url)
+        
+        # if email:
+        html_content = f"""
+<p>Dear {first_name or ''} {last_name or ''},</p>
+
+<p>We are pleased to inform you that your face scan has been successfully completed.</p>
+
+<p>Please find your detailed report attached to this email in PDF format.</p>
+
+<p>If you have any questions, feel free to reach out.</p>
+
+<p>Thank you for using our service.</p>
+""" 
+        send_email("dileep@raphacure.com", "Health Assessment Report", html_content, [report_url, report_v2_url])
 
         return {
             "status": "success",
