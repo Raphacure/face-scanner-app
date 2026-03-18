@@ -152,19 +152,15 @@ def process_video_frames(request, frame, scan_id, userId):
         if phone:
             send_whatsapp_pdf(phone, report_url, report_v2_url)
         
-        # if email:
-        html_content = f"""
-<p>Dear {first_name or ''} {last_name or ''},</p>
-
-<p>We are pleased to inform you that your face scan has been successfully completed.</p>
-
-<p>Please find your detailed report attached to this email in PDF format.</p>
-
-<p>If you have any questions, feel free to reach out.</p>
-
-<p>Thank you for using our service.</p>
-""" 
-        send_email("dileep@raphacure.com", "Health Assessment Report", html_content, [report_url, report_v2_url])
+        if email:
+            html_content = f"""
+            <p>Dear {first_name or ''} {last_name or ''},</p>
+            <p>We are pleased to inform you that your face scan has been successfully completed.</p>
+            <p>Please find your detailed report attached to this email in PDF format.</p>
+            <p>If you have any questions, feel free to reach out.</p>
+            <p>Thank you for using our service.</p>
+            """ 
+            send_email(email, "Health Assessment Report", html_content, [report_url, report_v2_url])
 
         return {
             "status": "success",
