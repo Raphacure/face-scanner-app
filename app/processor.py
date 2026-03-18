@@ -148,7 +148,7 @@ def process_video_frames(request, frame, scan_id, userId):
 
         # Send WhatsApp
         if phone:
-            send_whatsapp_pdf(phone, report_url)
+            send_whatsapp_pdf(phone, report_url, report_v2_url)
 
         return {
             "status": "success",
