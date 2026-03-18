@@ -1,8 +1,16 @@
 fastapi
 uvicorn[standard]
+python-multipart
+
 numpy
+scipy
 opencv-python
 mediapipe
+
 reportlab
-python-multipart
+
 boto3
+python-dotenv
+
+requests
+sendgrid
