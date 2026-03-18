@@ -13,7 +13,7 @@ import mediapipe as mp
 from app.core.frame_buffer import add_frame, is_ready, get_frames, clear, count
 from app.core.aggregator import calculate_all
 from app.quality.quality_aggregator import evaluate_scan_quality
-from app.pdf.report_generator import generate_health_report, get_user_details, insert_face_scan
+from app.pdf.report_generator import generate_health_report, generate_health_report_v2, get_user_details, insert_face_scan
 from app.aws.s3_uploader import upload_image_to_s3, upload_pdf_to_s3
 from app.whatsapp.send_whatsapp import send_whatsapp_pdf
 
@@ -56,6 +56,7 @@ def process_video_frames(request, frame, scan_id, userId):
 
     image_path = f"/tmp/scan_{scan_id}.jpg"
     filename = f"/tmp/report_{scan_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
+    filename_v2 = f"/tmp/report_v2_{scan_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
 
     try:
 
@@ -98,12 +99,14 @@ def process_video_frames(request, frame, scan_id, userId):
 
         data = calculate_all(frames,user)
         # --------------------------------------------------
-        # GENERATE PDF WITH IMAGE
+        # GENERATE PDFS (KEEP EXISTING + ADD V2)
         # --------------------------------------------------
         generate_health_report(user, data, filename,image_path)
+        generate_health_report_v2(user, data, filename_v2, face_image_path=image_path)
 
         # Upload PDF
         report_url = upload_pdf_to_s3(filename)
+        report_v2_url = upload_pdf_to_s3(filename_v2)
 
         # --------------------------------------------------
         # DEVICE + IP
@@ -136,7 +139,7 @@ def process_video_frames(request, frame, scan_id, userId):
             "device": device,
             "ip": ip_address,
             "user_id": userId,
-            "report_url": report_url,
+            "report_url": [report_url, report_v2_url],
             "image_url": image_url,
             "response": data
         }
@@ -151,7 +154,7 @@ def process_video_frames(request, frame, scan_id, userId):
             "status": "success",
             "quality": quality,
             "data": data,
-            "report_url": report_url,
+            "report_url": [report_url, report_v2_url],
             "image_url": image_url
         }
 
@@ -178,6 +181,11 @@ def process_video_frames(request, frame, scan_id, userId):
         try:
             if os.path.exists(filename):
                 os.remove(filename)
+        except:
+            pass
+        try:
+            if os.path.exists(filename_v2):
+                os.remove(filename_v2)
         except:
             pass
 

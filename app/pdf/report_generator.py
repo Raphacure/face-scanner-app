@@ -977,7 +977,19 @@ def generate_health_report_v2(
     right_col = [vitals_card, Spacer(1, 6), mental_card, Spacer(1, 6), dosha_card]
 
     body = Table([[left_col, silhouette_flowable, right_col]], colWidths=[2.9 * inch, 1.5 * inch, 2.9 * inch])
-    body.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+    body.setStyle(
+        TableStyle(
+            [
+                # Keep metric columns top-aligned
+                ("VALIGN", (0, 0), (0, 0), "TOP"),
+                ("VALIGN", (2, 0), (2, 0), "TOP"),
+                # Center the human silhouette vertically in the middle column
+                ("VALIGN", (1, 0), (1, 0), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ]
+        )
+    )
     story.append(body)
     story.append(Spacer(1, 4))
 
