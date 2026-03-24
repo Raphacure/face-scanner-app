@@ -26,7 +26,7 @@ face_detector = mp_face.FaceDetection(
     min_detection_confidence=0.5
 )
 
-def process_video_frames(request, frame, scan_id, userId):
+def process_video_frames(request, frame, scan_id, userId, clientId):
 
     small = cv2.resize(frame, (320, 240))
     rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
@@ -141,6 +141,7 @@ def process_video_frames(request, frame, scan_id, userId):
             "device": device,
             "ip": ip_address,
             "user_id": userId,
+            "client_id": clientId,
             "report_url": [report_url, report_v2_url],
             "image_url": image_url,
             "response": data

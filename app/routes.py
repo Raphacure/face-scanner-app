@@ -16,6 +16,7 @@ async def analyze(
     frames: List[UploadFile] = File(...),
     scanId: str = Form(...),
     userId: str = Form(...),
+    clientId: str = Form(...),
 ):
     final_response = None
 
@@ -32,7 +33,7 @@ async def analyze(
             if image is None:
                 continue
 
-            response = process_video_frames(request,image, scanId, userId)
+            response = process_video_frames(request,image, scanId, userId, clientId)
             final_response = response
             # todo
 
