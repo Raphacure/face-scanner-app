@@ -1,6 +1,6 @@
 from app.core.frame_buffer import clear
 from fastapi import APIRouter, UploadFile, File, Form,Request
-from typing import List
+from typing import List, Optional
 import cv2
 import numpy as np
 import gc
@@ -16,7 +16,7 @@ async def analyze(
     frames: List[UploadFile] = File(...),
     scanId: str = Form(...),
     userId: str = Form(...),
-    clientId: str = Form(...),
+    clientId: Optional[str] = Form(None),
 ):
     final_response = None
 
