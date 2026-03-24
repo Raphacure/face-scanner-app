@@ -141,7 +141,7 @@ def process_video_frames(request, frame, scan_id, userId, clientId):
             "device": device,
             "ip": ip_address,
             "user_id": userId,
-            "client_id": clientId,
+            "client_id": clientId if clientId else None,
             "report_url": [report_url, report_v2_url],
             "image_url": image_url,
             "response": data
