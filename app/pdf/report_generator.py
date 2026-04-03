@@ -15,34 +15,6 @@ from typing import Optional
 from reportlab.platypus import Flowable
 from reportlab.graphics.shapes import Drawing, Rect
 
-class RoundedImage(Flowable):
-    def __init__(self, img_path, width, height, radius=15):
-        super().__init__()
-        self.img_path = img_path
-        self.width = width
-        self.height = height
-        self.radius = radius
-
-    def draw(self):
-        c = self.canv
-
-        # Create clipping path
-        path = c.beginPath()
-        path.roundRect(0, 0, self.width, self.height, self.radius)
-
-        c.saveState()
-        c.clipPath(path, stroke=0, fill=0)
-
-        c.drawImage(
-            self.img_path,
-            0,
-            0,
-            width=self.width,
-            height=self.height,
-            mask='auto'
-        )
-
-        c.restoreState()
 # ==========================================================
 # ✅ NESTED METRIC GETTER
 # ==========================================================
@@ -183,17 +155,17 @@ DESCRIPTIONS = {
 # ==========================================================
 # ✅ SECTION TITLE
 # ==========================================================
-def section_title(text, styles):
+def section_title(text, styles, space_before=18):
     return Paragraph(
         text,
         ParagraphStyle(
-            "section",
+            f"section_sb{space_before}",
             parent=styles["Heading2"],
             alignment=1,
             backColor=colors.whitesmoke,
             spaceAfter=12,
-            spaceBefore=18
-        )
+            spaceBefore=space_before,
+        ),
     )
 
 
@@ -278,7 +250,7 @@ def hrv_details_block(metrics):
 # ==========================================================
 # ✅ MAIN PDF REPORT FUNCTION (ALL METRICS)
 # ==========================================================
-def generate_health_report(user, metrics, filename, image_path=None):
+def generate_health_report(user, metrics, filename):
 
     doc = SimpleDocTemplate(filename, pagesize=A4)
     styles = getSampleStyleSheet()
@@ -288,11 +260,18 @@ def generate_health_report(user, metrics, filename, image_path=None):
     # TITLE
     # ==========================================================
     story.append(Paragraph("Assessment Report", styles["Title"]))
-    story.append(Spacer(1, 25))
+    story.append(Spacer(1, 12))
 
     # ----------------------------------------------------------
-    # USER DETAILS
+    # USER DETAILS (centered under title, same visual line as title)
     # ----------------------------------------------------------
+    user_details_style = ParagraphStyle(
+        "report_user_details",
+        parent=styles["Normal"],
+        alignment=1,
+        leading=14,
+        spaceAfter=0,
+    )
     user_details = Paragraph(
         f"""
         <b>Name :</b> {user['name']}<br/>
@@ -300,43 +279,10 @@ def generate_health_report(user, metrics, filename, image_path=None):
         <b>Date of assessment :</b> {datetime.now().strftime('%d %b %Y')}<br/>
         <b>Age :</b> {user['age']}
         """,
-        styles["Normal"]
+        user_details_style,
     )
-
-    # ----------------------------------------------------------
-    # PROFILE IMAGE
-    # ----------------------------------------------------------
-    profile_image = ""
-
-    if image_path and os.path.exists(image_path):
-        try:
-            profile_image = RoundedImage(image_path, width=140, height=110, radius=15)
-        except:
-            profile_image = ""
-
-    # ----------------------------------------------------------
-    # HEADER TABLE
-    # ----------------------------------------------------------
-    header_table = Table(
-        [
-            ["", user_details, profile_image]
-        ],
-        colWidths=[360, 200]  
-    )
-    header_table.hAlign = "RIGHT"
-
-    header_table.setStyle(
-        TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-            ("TOPPADDING", (0, 0), (-1, -1), 0),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ])
-    )
-
-    story.append(header_table)
-    story.append(Spacer(1, 25))
+    story.append(user_details)
+    story.append(Spacer(1, 10))
     # ==========================================================
     # ALL SECTIONS + ALL METRICS
     # ==========================================================
@@ -393,9 +339,10 @@ def generate_health_report(user, metrics, filename, image_path=None):
     # ==========================================================
     # PRINT METRICS
     # ==========================================================
-    for section_name, metrics_list in sections.items():
-
-        story.append(section_title(section_name, styles))
+    for idx, (section_name, metrics_list) in enumerate(sections.items()):
+        # Tighter gap after user-details block; later sections keep default rhythm
+        sb = 6 if idx == 0 else 18
+        story.append(section_title(section_name, styles, space_before=sb))
 
         for title, path in metrics_list:
             story.append(metric_block(title, metrics, path))

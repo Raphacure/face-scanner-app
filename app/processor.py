@@ -103,7 +103,7 @@ def process_video_frames(request, frame, scan_id, userId, clientId):
         # --------------------------------------------------
         # GENERATE PDFS (KEEP EXISTING + ADD V2)
         # --------------------------------------------------
-        generate_health_report(user, data, filename,image_path)
+        generate_health_report(user, data, filename)
         generate_health_report_v2(user, data, filename_v2, face_image_path=image_path)
 
         # Upload PDF
