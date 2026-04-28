@@ -77,7 +77,4 @@ def calculate_all(frames,user):
     flat_results["dosha"] = calculate_dosha(context)
 
 
-    print("flat_results",flat_results)
-
-
     return group_metrics(flat_results)
