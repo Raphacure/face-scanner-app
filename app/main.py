@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
 os.environ["GLOG_minloglevel"] = "2"
@@ -9,10 +10,14 @@ import time
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
 from app.routes import router
 
 # ✅ IMPORT CLEANUP
 from app.core.frame_buffer import cleanup_expired
+
+# Always load .env from repository root
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 app = FastAPI(title="Face Scan AI Service")
