@@ -11,9 +11,14 @@ import requests
 from reportlab.platypus import Image    
 import os
 from typing import Optional
+import psycopg2
 
 from reportlab.platypus import Flowable
 from reportlab.graphics.shapes import Drawing, Rect
+from app.services.raw_sql.face_scan_queries import insert_face_scan_record
+from app.services.raw_sql.user_queries import (
+    get_user_details_by_id,
+)
 
 # ==========================================================
 # ✅ NESTED METRIC GETTER
@@ -1231,53 +1236,20 @@ def generate_health_report_v2(
     return filename
 
 def get_user_details(user_id):
-    url = "https://api.raphacure.com/api/v1/user/user-details"
-    
-    headers = {
-        "x-microservice-id": "RaphaCure_Microservice"
-    }
-    
-    params = {
-        "user_id": user_id
-    }
-    
-    response = requests.get(url, headers=headers, params=params)
+    result = get_user_details_by_id(user_id)
 
-
-    
-    # Raise exception for bad responses (4xx / 5xx)
-    response.raise_for_status()
-    
-    return response.json()["data"]
+    # Keep the same response shape used by processor.py.
+    return {"user": result["rows"]}
 
 
 def insert_face_scan(scanData):
     try:
-        url = "https://api.raphacure.com/api/v1/face-scan"
-
-        headers = {
-            "x-microservice-id": "RaphaCure_Microservice",
-            "Content-Type": "application/json"
-        }
-
-        response = requests.post(
-            url,
-            headers=headers,
-            json=scanData,      # ✅ CORRECT
-            timeout=10          # ✅ Always good practice
-        )
-
-
-        response.raise_for_status()
+        insert_face_scan_record(scanData)
 
         return {
             "status": "success",
         }
 
-    except requests.exceptions.RequestException as error:
-        print("Face Scan API Error:", error)
-
-        return {
-            "status": "error",
-            "message": "Face scan API request failed"
-        }
+    except psycopg2.Error as error:
+        print("Face Scan DB Error:", error)
+        raise

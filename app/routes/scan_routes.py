@@ -3,7 +3,7 @@ from typing import List, Optional
 
 from app.controllers.scan_controller import analyze_controller, cancel_scan_controller
 
-router = APIRouter()
+router = APIRouter(prefix="/facescan", tags=["facescan"])
 
 
 @router.post("/analyze")
