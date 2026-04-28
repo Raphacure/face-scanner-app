@@ -11,6 +11,7 @@ import requests
 from reportlab.platypus import Image    
 import os
 from typing import Optional
+import psycopg2
 
 from reportlab.platypus import Flowable
 from reportlab.graphics.shapes import Drawing, Rect
@@ -1249,10 +1250,6 @@ def insert_face_scan(scanData):
             "status": "success",
         }
 
-    except Exception as error:
+    except psycopg2.Error as error:
         print("Face Scan DB Error:", error)
-
-        return {
-            "status": "error",
-            "message": "Face scan DB insert failed"
-        }
+        raise

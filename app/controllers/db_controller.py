@@ -1,10 +1,14 @@
+import logging
+
 from fastapi import HTTPException, status
 
 from app.services.raw_sql.health_queries import health_check
 
+logger = logging.getLogger(__name__)
+
 
 SAFE_READ_QUERIES = {
-    "health_status": "SELECT 1 AS status",
+    "health_status": health_check,
 }
 
 
@@ -13,26 +17,22 @@ def db_health_check_controller() -> dict:
         result = health_check()
         return {"status": "ok", "db": result["rows"][0] if result["rows"] else None}
     except Exception as e:
+        logger.exception("DB health check failed")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"status": "error", "message": str(e)},
+            detail={"status": "error", "message": "Database unavailable"},
         ) from e
 
 
 def db_query_controller(query_name: str) -> dict:
-    if query_name not in SAFE_READ_QUERIES:
+    handler = SAFE_READ_QUERIES.get(query_name)
+    if handler is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unsupported query_name: {query_name}",
         )
     try:
-        if query_name == "health_status":
-            result = health_check()
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unsupported query_name: {query_name}",
-            )
+        result = handler()
         return {
             "status": "success",
             "query_name": query_name,
@@ -42,7 +42,8 @@ def db_query_controller(query_name: str) -> dict:
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("DB query failed for query_name=%s", query_name)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"status": "error", "message": str(e)},
+            detail={"status": "error", "message": "Database unavailable"},
         ) from e
