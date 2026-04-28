@@ -1,6 +1,6 @@
 from fastapi import HTTPException, status
 
-from app.services.raw_sql_service import health_check
+from app.services.raw_sql.health_queries import health_check
 
 
 SAFE_READ_QUERIES = {

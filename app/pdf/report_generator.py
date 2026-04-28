@@ -14,9 +14,9 @@ from typing import Optional
 
 from reportlab.platypus import Flowable
 from reportlab.graphics.shapes import Drawing, Rect
-from app.services.raw_sql_service import (
+from app.services.raw_sql.face_scan_queries import insert_face_scan_record
+from app.services.raw_sql.user_queries import (
     get_user_details_by_id,
-    insert_face_scan_record,
 )
 
 # ==========================================================
