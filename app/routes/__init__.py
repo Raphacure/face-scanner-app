@@ -8,12 +8,14 @@ from app.controllers.db_controller import db_health_check_controller
 from app.controllers.scan_controller import analyze_controller
 from app.controllers.user_controller import get_user_by_id_controller
 from app.routes.db_routes import router as db_router
+from app.routes.receipt_routes import router as receipt_router
 from app.routes.scan_routes import router as scan_router
 from app.routes.user_routes import router as user_router
 
 router = APIRouter(prefix="/api/v1")
 router.include_router(scan_router)
 router.include_router(db_router)
+router.include_router(receipt_router)
 router.include_router(user_router)
 
 logger = logging.getLogger(__name__)
