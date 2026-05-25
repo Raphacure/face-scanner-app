@@ -13,6 +13,8 @@ import cv2
 import numpy as np
 import requests
 
+from app.services.prescription_completeness import analyze_prescription_completeness
+
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 REQUEST_TIMEOUT_S = 20
 MAX_SIDE = 900
@@ -21,7 +23,7 @@ MAX_SIDE = 900
 CLASSIFICATION_MARGIN = 0.12
 
 
-def _fetch_image_bgr(url: str) -> np.ndarray:
+def fetch_image_bgr(url: str) -> np.ndarray:
     headers = {"User-Agent": "face-ai-service/receipt-classify"}
     with requests.get(
         url,
@@ -44,7 +46,7 @@ def _fetch_image_bgr(url: str) -> np.ndarray:
     return img
 
 
-def _resize_long_side(gray: np.ndarray, max_side: int) -> np.ndarray:
+def resize_long_side(gray: np.ndarray, max_side: int) -> np.ndarray:
     h, w = gray.shape[:2]
     m = max(h, w)
     if m <= max_side:
@@ -54,7 +56,7 @@ def _resize_long_side(gray: np.ndarray, max_side: int) -> np.ndarray:
     return cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_AREA)
 
 
-def _row_projection_peaks(proj: np.ndarray, min_dist: int) -> tuple[int, float]:
+def row_projection_peaks(proj: np.ndarray, min_dist: int) -> tuple[int, float]:
     p = proj.astype(np.float64)
     if p.max() <= 0:
         return 0, 0.0
@@ -72,8 +74,8 @@ def _row_projection_peaks(proj: np.ndarray, min_dist: int) -> tuple[int, float]:
     return len(peaks), reg
 
 
-def _raw_receipt_script_scores(gray: np.ndarray) -> tuple[float, float]:
-    gray = _resize_long_side(gray, MAX_SIDE)
+def raw_receipt_script_scores(gray: np.ndarray) -> tuple[float, float]:
+    gray = resize_long_side(gray, MAX_SIDE)
     bw = cv2.adaptiveThreshold(
         gray,
         255,
@@ -90,7 +92,7 @@ def _raw_receipt_script_scores(gray: np.ndarray) -> tuple[float, float]:
 
     proj = bw.sum(axis=1)
     min_dist = max(4, gray.shape[0] // 100)
-    n_peaks, gap_cv = _row_projection_peaks(proj, min_dist)
+    n_peaks, gap_cv = row_projection_peaks(proj, min_dist)
 
     edges = cv2.Canny(gray, 60, 160)
     lines = cv2.HoughLinesP(
@@ -133,9 +135,9 @@ def _raw_receipt_script_scores(gray: np.ndarray) -> tuple[float, float]:
 
 
 def classify_url(url: str) -> Dict[str, Any]:
-    img = _fetch_image_bgr(url)
+    img = fetch_image_bgr(url)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    r, h = _raw_receipt_script_scores(gray)
+    r, h = raw_receipt_script_scores(gray)
     m = CLASSIFICATION_MARGIN
     if r > h + m:
         label = "computer_generated_receipt"
@@ -145,6 +147,9 @@ def classify_url(url: str) -> Dict[str, Any]:
         label = "uncertain"
 
     denom = r + h + 1e-6
+    # CV amount detection only on handwritten-style docs (cash memos), not OPD grids.
+    allow_amount_cv = h >= r
+    completeness = analyze_prescription_completeness(img, gray, allow_amount_cv=allow_amount_cv)
     return {
         "url": url,
         "classification": label,
@@ -154,5 +159,6 @@ def classify_url(url: str) -> Dict[str, Any]:
             "receipt": float(r / denom),
             "prescription": float(h / denom),
         },
+        "completeness": completeness,
     }
 
