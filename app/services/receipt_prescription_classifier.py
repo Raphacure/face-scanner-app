@@ -147,9 +147,15 @@ def classify_url(url: str) -> Dict[str, Any]:
         label = "uncertain"
 
     denom = r + h + 1e-6
-    # CV amount detection only on handwritten-style docs (cash memos), not OPD grids.
-    allow_amount_cv = h >= r
-    completeness = analyze_prescription_completeness(img, gray, allow_amount_cv=allow_amount_cv)
+    is_printed_receipt = label == "computer_generated_receipt"
+    # Handwritten cash-memo CV; printed bills use column/total digit detection instead.
+    allow_amount_cv = h >= r and not is_printed_receipt
+    completeness = analyze_prescription_completeness(
+        img,
+        gray,
+        allow_amount_cv=allow_amount_cv,
+        is_printed_receipt=is_printed_receipt,
+    )
     return {
         "url": url,
         "classification": label,
