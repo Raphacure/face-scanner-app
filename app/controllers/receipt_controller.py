@@ -53,14 +53,19 @@ def public_row(url: str, row: Dict[str, Any]) -> Dict[str, Any]:
         and isinstance(fields.get("consultation_type"), dict)
         and bool(fields["consultation_type"].get("likely_present"))
     )
+    classification_reason = str(row.get("classification_reason") or "")
 
     if label == "handwritten_prescription":
         document_type = "handwritten"
         document_category = "prescription"
     elif label == "computer_generated_receipt":
         document_type = "computer_generated"
-        # Printed docs with billing cues are invoices; otherwise treat as reports.
-        document_category = "invoice" if (amount_present or consult_present) else "report"
+        # If promoted by report cues, keep it as report; else billing cues -> invoice.
+        if classification_reason == "printed_report_cues":
+            is_invoice = False
+        else:
+            is_invoice = amount_present or consult_present
+        document_category = "invoice" if is_invoice else "report"
     else:
         document_type = "uncertain"
         document_category = "report"

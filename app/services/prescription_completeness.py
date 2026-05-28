@@ -363,11 +363,11 @@ def consultation_type_score(text: str, gray: np.ndarray) -> float:
     return float(min(1.0, max(kw, table, layout)))
 
 
-def _digit_cluster_score(roi: np.ndarray) -> float:
-    """Count printed currency-style digit blobs in a ROI."""
+def _digitish_count(roi: np.ndarray) -> int:
+    """Count digit-like blobs in a ROI."""
     rh, rw = roi.shape[:2]
     if rh < 15 or rw < 15:
-        return 0.0
+        return 0
     bw = cv2.adaptiveThreshold(
         roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 9
     )
@@ -382,13 +382,7 @@ def _digit_cluster_score(roi: np.ndarray) -> float:
         wf, hf = cw / float(rw), ch / float(rh)
         if 0.008 <= wf <= 0.28 and 0.012 <= hf <= 0.14:
             digitish += 1
-    if digitish >= 4:
-        return 0.88
-    if digitish >= 2:
-        return 0.72
-    if digitish >= 1:
-        return 0.45
-    return 0.0
+    return digitish
 
 
 def printed_receipt_amount_score(gray: np.ndarray) -> float:
@@ -403,11 +397,22 @@ def printed_receipt_amount_score(gray: np.ndarray) -> float:
         (0.50, 0.82, 0.52, 0.98),  # gross / net summary
         (0.78, 0.94, 0.35, 0.98),  # payment row
     )
-    best = 0.0
+    counts: List[int] = []
     for y0f, y1f, x0f, x1f in regions:
         roi = small[int(h * y0f) : int(h * y1f), int(w * x0f) : int(w * x1f)]
-        best = max(best, _digit_cluster_score(roi))
-    return float(best)
+        counts.append(_digitish_count(roi))
+
+    col_count, summary_count, payment_count = counts
+    # Printed invoices have dense digits in amount column + summary + payment row.
+    if col_count >= 70 and summary_count >= 60 and payment_count >= 20:
+        return 0.9
+    if col_count >= 55 and summary_count >= 45 and payment_count >= 10:
+        return 0.72
+    if col_count >= 40 and summary_count >= 35:
+        return 0.42
+    if col_count >= 28 and summary_count >= 22:
+        return 0.3
+    return 0.0
 
 
 def amount_cv_score(gray: np.ndarray) -> float:
