@@ -26,7 +26,9 @@ class ReceiptPrescriptionClassifyRequest(BaseModel):
 @router.post("/classify-receipt")
 def classify_receipt_prescription(payload: ReceiptPrescriptionClassifyRequest):
     """
-    For each image URL: document type split, plus prescription completeness
+    For each image URL: primary document_type
+    (computer_generated/handwritten/uncertain), plus document_category
+    (prescription/invoice/report), and prescription completeness
     (stamp, hospital name/address, doctor name/signature, consultation type,
     amount). Each detected field adds ~14.29% to completeness_percent.
     """

@@ -41,22 +41,39 @@ def public_row(url: str, row: Dict[str, Any]) -> Dict[str, Any]:
     r_raw = float(row.get("receipt_raw", 0.0))
     h_raw = float(row.get("script_raw", 0.0))
     label = row.get("classification")
-    if label == "computer_generated_receipt":
-        doc_type = "computer_generated"
-    elif label == "handwritten_prescription":
-        doc_type = "handwritten"
+    comp = row.get("completeness")
+    fields = comp.get("fields") if isinstance(comp, dict) else None
+    amount_present = (
+        isinstance(fields, dict)
+        and isinstance(fields.get("amount"), dict)
+        and bool(fields["amount"].get("likely_present"))
+    )
+    consult_present = (
+        isinstance(fields, dict)
+        and isinstance(fields.get("consultation_type"), dict)
+        and bool(fields["consultation_type"].get("likely_present"))
+    )
+
+    if label == "handwritten_prescription":
+        document_type = "handwritten"
+        document_category = "prescription"
+    elif label == "computer_generated_receipt":
+        document_type = "computer_generated"
+        # Printed docs with billing cues are invoices; otherwise treat as reports.
+        document_category = "invoice" if (amount_present or consult_present) else "report"
     else:
-        doc_type = "uncertain"
+        document_type = "uncertain"
+        document_category = "report"
 
     handwritten_pct, computer_pct = split_percentages(r_raw, h_raw, label)
 
     out: Dict[str, Any] = {
         "url": url,
-        "document_type": doc_type,
+        "document_type": document_type,
+        "document_category": document_category,
         "handwritten_percent": handwritten_pct,
         "computer_generated_percent": computer_pct,
     }
-    comp = row.get("completeness")
     if isinstance(comp, dict):
         out["completeness_percent"] = float(comp.get("completeness_percent", 0.0))
         out["present_count"] = int(comp.get("present_count", 0))
