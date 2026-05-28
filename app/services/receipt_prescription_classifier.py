@@ -134,6 +134,42 @@ def raw_receipt_script_scores(gray: np.ndarray) -> tuple[float, float]:
     return float(receipt_raw), float(script_raw)
 
 
+def _is_likely_present(completeness: Dict[str, Any], key: str, min_conf: float = 0.0) -> bool:
+    fields = completeness.get("fields")
+    if not isinstance(fields, dict):
+        return False
+    entry = fields.get(key)
+    if not isinstance(entry, dict):
+        return False
+    if not bool(entry.get("likely_present")):
+        return False
+    return float(entry.get("confidence_percent", 0.0)) >= min_conf
+
+
+def refine_label_with_completeness(label: str, completeness: Dict[str, Any]) -> tuple[str, str]:
+    """
+    Correct obvious printed invoices that raw texture scoring can mark handwritten.
+    """
+    amount_present = _is_likely_present(completeness, "amount", min_conf=55.0)
+    consult_present = _is_likely_present(completeness, "consultation_type", min_conf=55.0)
+    hospital_name_present = _is_likely_present(completeness, "hospital_name", min_conf=45.0)
+    hospital_address_present = _is_likely_present(completeness, "hospital_address", min_conf=45.0)
+    doctor_present = _is_likely_present(completeness, "doctor_name", min_conf=40.0)
+
+    printed_invoice_cues = amount_present and consult_present and (
+        hospital_name_present or hospital_address_present
+    )
+    if printed_invoice_cues:
+        return "computer_generated_receipt", "printed_invoice_cues"
+
+    printed_report_cues = (not amount_present) and consult_present and (
+        (hospital_name_present and hospital_address_present) or doctor_present
+    )
+    if printed_report_cues and label != "computer_generated_receipt":
+        return "computer_generated_receipt", "printed_report_cues"
+    return label, "raw_score"
+
+
 def classify_url(url: str) -> Dict[str, Any]:
     img = fetch_image_bgr(url)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -156,6 +192,19 @@ def classify_url(url: str) -> Dict[str, Any]:
         allow_amount_cv=allow_amount_cv,
         is_printed_receipt=is_printed_receipt,
     )
+
+    refined_label, refine_reason = refine_label_with_completeness(label, completeness)
+    if refined_label != label:
+        label = refined_label
+        is_printed_receipt = label == "computer_generated_receipt"
+        allow_amount_cv = h >= r and not is_printed_receipt
+        completeness = analyze_prescription_completeness(
+            img,
+            gray,
+            allow_amount_cv=allow_amount_cv,
+            is_printed_receipt=is_printed_receipt,
+        )
+
     return {
         "url": url,
         "classification": label,
@@ -165,6 +214,7 @@ def classify_url(url: str) -> Dict[str, Any]:
             "receipt": float(r / denom),
             "prescription": float(h / denom),
         },
+        "classification_reason": refine_reason,
         "completeness": completeness,
     }
 
