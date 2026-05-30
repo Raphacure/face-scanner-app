@@ -15,4 +15,4 @@ python-dotenv
 requests
 sendgrid
 psycopg2-binary
-pytesseract
+openai>=1.40.0
