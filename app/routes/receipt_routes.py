@@ -13,7 +13,7 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 
 
 class ReceiptPrescriptionClassifyRequest(BaseModel):
-    """Image URLs of documents to separate receipts from handwritten prescriptions."""
+    """Public image URLs of medical documents to classify via OpenAI Vision."""
 
     urls: List[str] = Field(
         ...,
@@ -26,10 +26,8 @@ class ReceiptPrescriptionClassifyRequest(BaseModel):
 @router.post("/classify-receipt")
 def classify_receipt_prescription(payload: ReceiptPrescriptionClassifyRequest):
     """
-    For each image URL: primary document_type
-    (computer_generated/handwritten/uncertain), plus document_category
-    (prescription/invoice/report), and prescription completeness
-    (stamp, hospital name/address, doctor name/signature, consultation type,
-    amount). Each detected field adds ~14.29% to completeness_percent.
+    For each image URL: document_type (computer_generated/handwritten/uncertain),
+    document_category (prescription/invoice/report), completeness fields, and
+    percentages. Classification uses OpenAI Vision only (requires OPENAI_API_KEY).
     """
     return classify_receipt_prescription_urls_controller(payload.urls)
