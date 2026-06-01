@@ -36,24 +36,28 @@ document_type (how the transaction details were filled — not just the blank fo
   line items or totals)
 - uncertain: cannot tell
 
-document_category (what kind of document):
-- prescription: doctor Rx / medicines / dosage advice; NOT a paid pharmacy cash memo
-- invoice: bill/receipt with amounts and line items (hospital OP bill, pharmacy bill, tax invoice)
-- report: lab/diagnostic/clinical report (audiogram, blood test) without billing as the focus
+document_category (what kind of document) — choose ONE using this order:
+1. prescription: doctor's Rx pad with medicines (Tab/Inj/Syp), dosage (OD/BD/TDS), Rx symbol,
+   vitals, or clinical advice. NO payment total / no rupee billing column required.
+   Letterhead with clinic addresses is NOT an invoice.
+2. invoice: ONLY if you see billing — rupee amounts, rate/qty/total columns, "bill", "receipt",
+   "paid", grand total, payment mode, or pharmacy cash memo with priced line items.
+3. report: diagnostic output (audiogram graphs, lab values, PTA, radiology) — not Rx, not a bill.
+
+CRITICAL: Doctor prescription on letterhead with stamp/signature but NO rupee total → prescription,
+NEVER invoice. Hospital/clinic name on letterhead does not make it an invoice.
 
 For each completeness field, set likely_present true only if clearly visible in the image.
 confidence_percent is 0-100 (how sure you are that the field is present).
 
 Rules:
-- Printed hospital letterhead on a handwritten Rx pad → handwritten + prescription
-- Pharmacy/medical store bill pad: printed headers but handwritten table rows and total →
-  handwritten + invoice (NOT computer_generated)
+- Handwritten Rx pad (Dr. + medicines + stamp) → handwritten + prescription
+- Pharmacy bill pad with handwritten prices/total → handwritten + invoice
 - Hospital OP bill / bill cum receipt fully printed → computer_generated + invoice
-- Audiogram, pure tone test, diagnostic tables without billing → computer_generated + report
-- Stamp means rubber stamp/seal, not just printed logo
-- amount means billing/payment amounts (Rs/INR/total), not clinical measurements (dB, Hz)
-- handwritten_percent should be high when handwritten content dominates; computer_generated_percent
-  high only for fully printed/digital documents
+- Audiogram / lab report → computer_generated + report
+- Stamp = rubber stamp/seal, not printed logo alone
+- amount = Rs/INR/bill total/payment only; NOT clinical numbers (dB, vit D3 levels as tests)
+- consultation_type = OPD/IPD/consultation line on a BILL; false on pure Rx unless explicitly stated
 """
 
 DOCUMENT_SCHEMA: Dict[str, Any] = {
@@ -110,6 +114,33 @@ def _normalize_field_entry(raw: Any) -> Dict[str, Any]:
     }
 
 
+def _field_present(fields: Dict[str, Any], key: str) -> bool:
+    entry = fields.get(key)
+    return isinstance(entry, dict) and bool(entry.get("likely_present"))
+
+
+def _correct_document_category(
+    doc_type: str,
+    category: str,
+    fields: Dict[str, Any],
+) -> str:
+    """Fix common OpenAI mistake: Rx letterhead labeled invoice without billing."""
+    amount = _field_present(fields, "amount")
+    consult = _field_present(fields, "consultation_type")
+
+    if category != "invoice":
+        return category
+
+    # Invoice requires visible billing; Rx pads often have hospital header but no amount.
+    if not amount:
+        if doc_type == "handwritten":
+            return "prescription"
+        if doc_type == "computer_generated" and not consult:
+            return "report"
+
+    return category
+
+
 def _build_public_response(url: str, data: Dict[str, Any]) -> Dict[str, Any]:
     doc_type = str(data.get("document_type", "uncertain"))
     if doc_type not in ("handwritten", "computer_generated", "uncertain"):
@@ -143,6 +174,8 @@ def _build_public_response(url: str, data: Dict[str, Any]) -> Dict[str, Any]:
         else:
             entry["contribution_percent"] = 0.0
         fields[key] = entry
+
+    category = _correct_document_category(doc_type, category, fields)
 
     return {
         "url": url,
@@ -209,8 +242,8 @@ def classify_document_url_openai(url: str) -> Dict[str, Any]:
 
     user_text = (
         "Analyze this medical document image and return JSON matching the schema. "
-        "Pharmacy bill pads with handwritten patient/items/totals → handwritten + invoice. "
-        "Fully printed hospital bills → computer_generated + invoice."
+        "Doctor Rx with medicines and stamp but no rupee bill total → prescription, not invoice. "
+        "Only use invoice when billing amounts or receipt totals are visible."
     )
 
     data = _call_openai_vision(
