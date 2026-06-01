@@ -26,8 +26,7 @@ class ReceiptPrescriptionClassifyRequest(BaseModel):
 @router.post("/classify-receipt")
 def classify_receipt_prescription(payload: ReceiptPrescriptionClassifyRequest):
     """
-    For each image URL: document_type (computer_generated/handwritten/uncertain),
-    document_category (prescription/invoice/report), completeness fields, and
-    percentages. Classification uses OpenAI Vision only (requires OPENAI_API_KEY).
+    For each image URL: document_type (handwritten/computer_generated), document_category,
+    and extracted parameters. Requires OPENAI_API_KEY.
     """
     return classify_receipt_prescription_urls_controller(payload.urls)
