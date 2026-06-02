@@ -1,9 +1,13 @@
 from typing import Any, Dict, List
 
+import os
+import time
+
 from app.core.openai_client import openai_configured
 from app.services.openai_document_classifier import classify_document_url_openai
 
 MAX_URLS = 25
+_INTER_URL_DELAY_MS = max(0, int(os.getenv("OPENAI_INTER_URL_DELAY_MS", "500")))
 
 
 def classify_receipt_prescription_urls_controller(urls: List[str]) -> Dict[str, Any]:
@@ -22,7 +26,9 @@ def classify_receipt_prescription_urls_controller(urls: List[str]) -> Dict[str, 
 
     results: List[Dict[str, Any]] = []
 
-    for url in urls:
+    for index, url in enumerate(urls):
+        if index > 0 and _INTER_URL_DELAY_MS > 0:
+            time.sleep(_INTER_URL_DELAY_MS / 1000.0)
         u = (url or "").strip()
         if not u:
             results.append({"url": url or "", "error": "empty url"})

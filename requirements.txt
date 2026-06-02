@@ -16,3 +16,4 @@ requests
 sendgrid
 psycopg2-binary
 openai>=1.40.0
+pymupdf>=1.24.0

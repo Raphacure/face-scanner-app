@@ -9,14 +9,19 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Sequence, Tuple
 
+from openai import APIStatusError, RateLimitError
+
 from app.core.openai_client import get_openai_client
-from app.services.document_image_fetch import download_image_data_url
+from app.services.document_image_fetch import build_vision_image_blocks
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MAX_RETRIES = max(1, int(os.getenv("OPENAI_MAX_RETRIES", "6")))
+OPENAI_INTER_CALL_DELAY_MS = max(0, int(os.getenv("OPENAI_INTER_CALL_DELAY_MS", "400")))
 
 _STRING_ARRAY = {"type": "array", "items": {"type": "string"}}
 
@@ -811,55 +816,105 @@ def _peek_invoice_needs_refine(data: Dict[str, Any]) -> bool:
     return False
 
 
+def _retry_wait_seconds(error: Exception, attempt: int) -> float:
+    """Parse OpenAI 'try again in Xms' or use exponential backoff."""
+    message = str(error)
+    match_ms = re.search(r"try again in (\d+(?:\.\d+)?)\s*ms", message, re.IGNORECASE)
+    if match_ms:
+        return float(match_ms.group(1)) / 1000.0 + 0.05
+    match_s = re.search(r"try again in (\d+(?:\.\d+)?)\s*s", message, re.IGNORECASE)
+    if match_s:
+        return float(match_s.group(1)) + 0.05
+    return min(60.0, 0.5 * (2**attempt))
+
+
+def _is_rate_limit_error(error: Exception) -> bool:
+    if isinstance(error, RateLimitError):
+        return True
+    if isinstance(error, APIStatusError) and error.status_code == 429:
+        return True
+    return "rate_limit" in str(error).lower() or "429" in str(error)
+
+
 def _call_openai_json(
     client: Any,
     model: str,
     system: str,
     user_text: str,
-    image_content: Dict[str, Any],
+    image_blocks: List[Dict[str, Any]],
     schema_name: str,
     schema: Dict[str, Any],
     max_tokens: int,
 ) -> Dict[str, Any]:
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": user_text}, image_content],
-            },
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {"name": schema_name, "strict": True, "schema": schema},
-        },
-        temperature=0.0,
-        max_tokens=max_tokens,
-    )
-    content = response.choices[0].message.content
-    if not content:
-        raise ValueError("Empty response from OpenAI")
-    parsed = json.loads(content)
-    if not isinstance(parsed, dict):
-        raise ValueError("OpenAI response is not a JSON object")
-    return parsed
+    last_error: Exception | None = None
+    for attempt in range(OPENAI_MAX_RETRIES):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": user_text}, *image_blocks],
+                    },
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": schema_name, "strict": True, "schema": schema},
+                },
+                temperature=0.0,
+                max_tokens=max_tokens,
+            )
+            content = response.choices[0].message.content
+            if not content:
+                raise ValueError("Empty response from OpenAI")
+            parsed = json.loads(content)
+            if not isinstance(parsed, dict):
+                raise ValueError("OpenAI response is not a JSON object")
+            return parsed
+        except Exception as exc:
+            last_error = exc
+            if not _is_rate_limit_error(exc) or attempt >= OPENAI_MAX_RETRIES - 1:
+                raise
+            wait = _retry_wait_seconds(exc, attempt)
+            logger.warning(
+                "OpenAI rate limit on %s (attempt %s/%s), retrying in %.2fs",
+                schema_name,
+                attempt + 1,
+                OPENAI_MAX_RETRIES,
+                wait,
+            )
+            time.sleep(wait)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("OpenAI call failed without error detail")
+
+
+def _pause_between_openai_calls() -> None:
+    if OPENAI_INTER_CALL_DELAY_MS > 0:
+        time.sleep(OPENAI_INTER_CALL_DELAY_MS / 1000.0)
 
 
 def _call_openai_vision(
     client: Any,
     model: str,
-    image_content: Dict[str, Any],
+    image_blocks: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    page_note = (
+        " Multiple pages attached — read all pages and merge extracted fields."
+        if len(image_blocks) > 1
+        else ""
+    )
     return _call_openai_json(
         client,
         model,
         SYSTEM_PROMPT,
         (
-            "Classify content type and extract parameters. "
-            "Fill only the matching parameter object."
+            "Classify content type and extract parameters."
+            + page_note
+            + " Fill only the matching parameter object."
         ),
-        image_content,
+        image_blocks,
         "medical_document_extraction",
         DOCUMENT_SCHEMA,
         3000,
@@ -869,7 +924,7 @@ def _call_openai_vision(
 def _refine_prescription_medicines(
     client: Any,
     model: str,
-    image_content: Dict[str, Any],
+    image_blocks: List[Dict[str, Any]],
     data: Dict[str, Any],
 ) -> None:
     rx_model = (os.getenv("OPENAI_RX_MODEL") or model).strip()
@@ -878,7 +933,7 @@ def _refine_prescription_medicines(
         rx_model,
         PRESCRIPTION_MEDICINE_PROMPT,
         "List every advised test and every prescribed medicine on this Rx.",
-        image_content,
+        image_blocks,
         "prescription_medicine_extraction",
         PRESCRIPTION_MEDICINE_SCHEMA,
         2000,
@@ -889,7 +944,7 @@ def _refine_prescription_medicines(
 def _refine_diagnostic_invoice(
     client: Any,
     model: str,
-    image_content: Dict[str, Any],
+    image_blocks: List[Dict[str, Any]],
     data: Dict[str, Any],
 ) -> None:
     inv_model = (os.getenv("OPENAI_INVOICE_MODEL") or model).strip()
@@ -898,7 +953,7 @@ def _refine_diagnostic_invoice(
         inv_model,
         DIAGNOSTIC_INVOICE_PROMPT,
         "Extract content type, patient, doctor, and all test lines with prices.",
-        image_content,
+        image_blocks,
         "diagnostic_invoice_extraction",
         DIAGNOSTIC_INVOICE_SCHEMA,
         2000,
@@ -909,7 +964,7 @@ def _refine_diagnostic_invoice(
 def _refine_lab_report(
     client: Any,
     model: str,
-    image_content: Dict[str, Any],
+    image_blocks: List[Dict[str, Any]],
     data: Dict[str, Any],
 ) -> None:
     report_model = (os.getenv("OPENAI_REPORT_MODEL") or model).strip()
@@ -918,7 +973,7 @@ def _refine_lab_report(
         report_model,
         LAB_REPORT_PROMPT,
         "Classify printed vs handwritten content and extract lab test fields.",
-        image_content,
+        image_blocks,
         "lab_report_extraction",
         LAB_REPORT_SCHEMA,
         2000,
@@ -930,25 +985,24 @@ def classify_document_url_openai(url: str) -> Dict[str, Any]:
     """Classify one image URL and return category-specific extracted parameters."""
     model = (os.getenv("OPENAI_MODEL") or DEFAULT_MODEL).strip()
     client = get_openai_client()
-    data_url, _ = download_image_data_url(url)
-    image_content = {
-        "type": "image_url",
-        "image_url": {"url": data_url, "detail": "high"},
-    }
-    data = _call_openai_vision(client, model, image_content)
+    image_blocks, _ = build_vision_image_blocks(url)
+    data = _call_openai_vision(client, model, image_blocks)
     if _peek_prescription_category(data) == "prescription":
         try:
-            _refine_prescription_medicines(client, model, image_content, data)
+            _pause_between_openai_calls()
+            _refine_prescription_medicines(client, model, image_blocks, data)
         except Exception:
             logger.exception("Prescription medicine refine pass failed for %s", url)
     elif _peek_invoice_needs_refine(data):
         try:
-            _refine_diagnostic_invoice(client, model, image_content, data)
+            _pause_between_openai_calls()
+            _refine_diagnostic_invoice(client, model, image_blocks, data)
         except Exception:
             logger.exception("Diagnostic invoice refine pass failed for %s", url)
     elif _peek_report_needs_refine(data):
         try:
-            _refine_lab_report(client, model, image_content, data)
+            _pause_between_openai_calls()
+            _refine_lab_report(client, model, image_blocks, data)
         except Exception:
             logger.exception("Lab report refine pass failed for %s", url)
     return _build_public_response(url, data)
