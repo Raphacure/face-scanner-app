@@ -44,8 +44,8 @@ PRESCRIPTION_PARAM_KEYS: Tuple[str, ...] = (
     "doctor_name",
     "doctor_registration_number",
     "doctor_signature",
+    "doctor_stamp",
     "diagnosis",
-    "complaints",
     "prescribed_medicines",
     "advised_tests",
     "treatment_plan",
@@ -63,8 +63,6 @@ INVOICE_PARAM_KEYS: Tuple[str, ...] = (
     "service_details",
     "medicine_details",
     "test_details",
-    "quantity",
-    "unit_price",
     "total_amount",
     "payment_mode",
     "transaction_reference",
@@ -98,6 +96,7 @@ PRESCRIPTION_REQUIRED: Tuple[str, ...] = (
     "doctor_name",
     "doctor_registration_number",
     "doctor_signature",
+    "doctor_stamp",
 )
 
 INVOICE_REQUIRED: Tuple[str, ...] = (
@@ -119,7 +118,20 @@ REPORT_REQUIRED: Tuple[str, ...] = (
 )
 
 _INVOICE_ARRAY_KEYS = frozenset({"service_details", "medicine_details", "test_details"})
+_INVOICE_DETAIL_LIST_KEYS = frozenset({"medicine_details", "test_details"})
 _REPORT_ARRAY_KEYS = frozenset({"test_names", "test_results", "reference_ranges"})
+
+_PRESCRIPTION_REFINE_STRING_KEYS = (
+    "doctor_registration_number",
+    "doctor_signature",
+    "doctor_stamp",
+)
+
+_DOCTOR_REG_IN_TEXT_RE = re.compile(
+    r"(?:RMC|MCI|MMC|reg\.?\s*no\.?|registration\s*no\.?)\s*[:\s#-]*([A-Za-z0-9][A-Za-z0-9/\-\s]{2,20})",
+    re.IGNORECASE,
+)
+_DOCTOR_REG_DIGITS_RE = re.compile(r"\b(\d{4,6}(?:/\d{2,6})?)\b")
 
 # Pattern heuristics for printed form rows / section titles (not fixed test-name lists).
 _INVOICE_PRINTED_ROW_RE = re.compile(
@@ -148,9 +160,29 @@ _INVOICE_REFINE_STRING_KEYS = (
     "patient_name",
     "invoice_number",
     "invoice_date",
+    "provider_name",
+    "provider_address",
+    "provider_contact",
     "doctor_name",
     "total_amount",
+    "gst_number",
+    "drug_license_number",
+    "authorized_stamp",
     "authorized_signature",
+)
+
+_PHARMACY_BILL_HINTS = frozenset(
+    {
+        "pharmacy",
+        "chemist",
+        "medical store",
+        "bill of supply",
+        "medicines",
+        "drug license",
+        "dl no",
+        "gst",
+        "pharmacist",
+    }
 )
 
 
@@ -196,12 +228,25 @@ CONTENT (filled-in data only — patient name, dates, tests, medicines, amounts,
 content_handwritten_percent / content_computer_generated_percent = split of filled content only. Must sum to 100.
 Cash memo with handwritten patient/tests/prices → document_type=handwritten, content_handwritten_percent ~100.
 
-document_category: prescription | invoice | report. Rx without rupee total → prescription, NEVER invoice.
+document_category:
+- prescription | invoice | report — valid medical claim documents for insurance.
+- pharmacy/chemist Bill of Supply, tax invoice, cash memo from medical store ARE invoices (is_medical_document=true, invoice_subtype=pharmacy).
+- diagnostic center bills → invoice_subtype=diagnostic. Hospital OPD bills → opd_consultation.
+- other — ONLY for non-documents: app screenshots, error popups, phone UI, selfies, blank/unreadable images.
+  Do NOT mark pharmacy bills or hospital bills as other.
+
+is_medical_document=true for Rx, pharmacy bill, diagnostic bill, lab report.
+
+Rx without rupee total → prescription, NEVER invoice.
 
 invoice_subtype (invoice only): pharmacy | diagnostic | opd_consultation | uncertain | not_applicable.
 
-Invoice: test_details as "Test — Rs amount"; do not use printed row labels alone. Extract patient_name, doctor_name from handwriting.
+Invoice / pharmacy bill: medicine_details[] as product name strings (full PRODUCT NAME & PACKING per row).
+Diagnostic bill: test_details[] as "Test name — Rs amount" per line.
 Prescription: all medicines as {medicine,dosage}; advised_tests for labs only.
+doctor_registration_number: read from rubber stamp, letterhead, or printed text (RMC No., Reg No., MCI, MMC — e.g. "70486/29204"). NOT empty if visible in stamp.
+doctor_stamp: "present" if stamp visible but text illegible; otherwise short stamp text.
+doctor_signature: "present" if signed but illegible.
 
 Report (lab/radiology):
 - Formal lab report with TYPED/PRINTED patient, date, test name, numeric result, reference range → document_type=computer_generated, content_computer_generated_percent 95-100 (only signature may be handwritten ~0-10%).
@@ -210,15 +255,27 @@ Report (lab/radiology):
 - pathologist_signature: "present" if handwritten signature visible.
 """
 
-PRESCRIPTION_MEDICINE_SCHEMA: Dict[str, Any] = {
+PRESCRIPTION_REFINE_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "advised_tests": _STRING_ARRAY,
         "prescribed_medicines": {"type": "array", "items": _MEDICINE_ITEM_SCHEMA},
+        "doctor_registration_number": {"type": "string"},
+        "doctor_signature": {"type": "string"},
+        "doctor_stamp": {"type": "string"},
     },
-    "required": ["advised_tests", "prescribed_medicines"],
+    "required": [
+        "advised_tests",
+        "prescribed_medicines",
+        "doctor_registration_number",
+        "doctor_signature",
+        "doctor_stamp",
+    ],
     "additionalProperties": False,
 }
+
+# Backward-compatible alias
+PRESCRIPTION_MEDICINE_SCHEMA = PRESCRIPTION_REFINE_SCHEMA
 
 DIAGNOSTIC_INVOICE_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -234,9 +291,14 @@ DIAGNOSTIC_INVOICE_SCHEMA: Dict[str, Any] = {
         "invoice_number": {"type": "string"},
         "invoice_date": {"type": "string"},
         "total_amount": {"type": "string"},
+        "provider_name": {"type": "string"},
+        "provider_address": {"type": "string"},
+        "gst_number": {"type": "string"},
+        "drug_license_number": {"type": "string"},
         "test_details": _STRING_ARRAY,
         "medicine_details": _STRING_ARRAY,
         "service_details": _STRING_ARRAY,
+        "authorized_stamp": {"type": "string"},
         "authorized_signature": {"type": "string"},
     },
     "required": [
@@ -248,23 +310,34 @@ DIAGNOSTIC_INVOICE_SCHEMA: Dict[str, Any] = {
         "invoice_number",
         "invoice_date",
         "total_amount",
+        "provider_name",
+        "provider_address",
+        "gst_number",
+        "drug_license_number",
         "test_details",
         "medicine_details",
         "service_details",
+        "authorized_stamp",
         "authorized_signature",
     ],
     "additionalProperties": False,
 }
 
-DIAGNOSTIC_INVOICE_PROMPT = """Medical bill / cash memo image.
+INVOICE_REFINE_PROMPT = """Medical bill image — pharmacy Bill of Supply, chemist invoice, diagnostic cash memo, or OPD bill.
 
-CONTENT (filled fields only):
-- document_type: handwritten if patient, doctor, tests, prices, total are handwritten; computer_generated if all typed/printed.
-- content_handwritten_percent + content_computer_generated_percent = 100 (content only, ignore blank template).
+These ARE valid medical claim documents (is_medical_document=true, document_category=invoice).
 
-Extract: patient_name, doctor_name, invoice_number, invoice_date, total_amount, authorized_signature.
-test_details: every test with price — "Vit D-3 — Rs 600" (not printed labels like Blood Examination alone).
-service_details: extra fees only; medicine_details: drugs if pharmacy."""
+CONTENT: document_type and content_handwritten_percent / content_computer_generated_percent (sum 100).
+
+Pharmacy / Bill of Supply:
+- invoice_subtype=pharmacy
+- provider_name, provider_address, patient_name, invoice_number, invoice_date, total_amount
+- gst_number, drug_license_number (DL No.)
+- medicine_details[]: one string per medicine row (product name and packing as printed)
+- authorized_stamp or authorized_signature (pharmacist stamp/signature counts)
+- doctor_name if "Prescribed by" shown (optional)
+
+Diagnostic bill: test_details[] with test and price per line. OPD: service_details consultation fee."""
 
 _REPORT_REFINE_STRING_KEYS = (
     "patient_name",
@@ -326,11 +399,19 @@ CONTENT type (filled data only — ignore letterhead/layout):
 Extract test_names as the specific investigation (e.g. "Sr. Uric Acid"), NOT section headers like "EXAMINATION OF BLOOD" alone.
 test_results and reference_ranges as parallel array entries per test."""
 
-PRESCRIPTION_MEDICINE_PROMPT = """Extract ONLY from this prescription (Rx) image.
+PRESCRIPTION_MEDICINE_PROMPT = """Extract from this prescription (Rx) image.
 
-advised_tests — lab tests only (Vit D3, CBC, uric acid). NOT medicines.
+1) prescribed_medicines — EVERY drug line {medicine, dosage}; scan full page.
 
-prescribed_medicines — EVERY drug line {medicine, dosage}; scan full page; do not stop after two items."""
+2) advised_tests — lab tests only (CBC, Widal, electrolytes, etc.). NOT medicines.
+
+3) doctor_registration_number — READ THE RUBBER STAMP and letterhead closely.
+   Look for RMC No., Reg. No., MCI, MMC, registration numbers (often digits with slash, e.g. 70486/29204).
+   Copy the number exactly. Use "" only if truly not visible.
+
+4) doctor_stamp — if stamp text is readable, include key stamp text; if stamp visible but unreadable use "present".
+
+5) doctor_signature — "present" if signature visible but illegible."""
 
 DOCUMENT_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -341,9 +422,11 @@ DOCUMENT_SCHEMA: Dict[str, Any] = {
         },
         "content_handwritten_percent": {"type": "number"},
         "content_computer_generated_percent": {"type": "number"},
+        "is_medical_document": {"type": "boolean"},
+        "non_medical_reason": {"type": "string"},
         "document_category": {
             "type": "string",
-            "enum": ["prescription", "invoice", "report"],
+            "enum": ["prescription", "invoice", "report", "other"],
         },
         "invoice_subtype": {
             "type": "string",
@@ -363,6 +446,8 @@ DOCUMENT_SCHEMA: Dict[str, Any] = {
         "document_type",
         "content_handwritten_percent",
         "content_computer_generated_percent",
+        "is_medical_document",
+        "non_medical_reason",
         "document_category",
         "invoice_subtype",
         "prescription_parameters",
@@ -371,6 +456,8 @@ DOCUMENT_SCHEMA: Dict[str, Any] = {
     ],
     "additionalProperties": False,
 }
+
+_VALID_CATEGORIES = frozenset({"prescription", "invoice", "report", "other"})
 
 
 def _str_val(raw: Any) -> str:
@@ -405,6 +492,23 @@ def _normalize_prescribed_medicines(raw: Any) -> List[Dict[str, str]]:
     return items
 
 
+def _normalize_invoice_detail_list(raw: Any) -> List[str]:
+    """medicine_details / test_details as string arrays (coerce legacy object rows)."""
+    if not isinstance(raw, list):
+        return []
+    items: List[str] = []
+    for entry in raw:
+        if isinstance(entry, dict):
+            name = _str_val(entry.get("name") or entry.get("product"))
+            if name:
+                items.append(name)
+        else:
+            line = _str_val(entry)
+            if line:
+                items.append(line)
+    return items
+
+
 def _normalize_params(
     raw: Any,
     keys: Sequence[str],
@@ -415,6 +519,8 @@ def _normalize_params(
     for key in keys:
         if key == "prescribed_medicines":
             result[key] = _normalize_prescribed_medicines(data.get(key))
+        elif key in _INVOICE_DETAIL_LIST_KEYS:
+            result[key] = _normalize_invoice_detail_list(data.get(key))
         elif key in array_keys:
             result[key] = _list_val(data.get(key))
         else:
@@ -425,6 +531,33 @@ def _normalize_params(
 def _merge_string_field(target: Dict[str, Any], key: str, value: str) -> None:
     if _str_val(value) and not _str_val(target.get(key)):
         target[key] = _str_val(value)
+
+
+def _normalize_doctor_registration(params: Dict[str, Any]) -> None:
+    """Fill doctor_registration_number from stamp text when the model only marked stamp present."""
+    reg = _str_val(params.get("doctor_registration_number"))
+    if reg and reg.lower() != "present":
+        params["doctor_registration_number"] = reg
+        return
+
+    stamp = _str_val(params.get("doctor_stamp"))
+    sources = [stamp, _str_val(params.get("doctor_name"))]
+    for source in sources:
+        if not source:
+            continue
+        match = _DOCTOR_REG_IN_TEXT_RE.search(source)
+        if match:
+            params["doctor_registration_number"] = match.group(1).strip()
+            return
+        digit_match = _DOCTOR_REG_DIGITS_RE.search(source)
+        if digit_match and stamp and stamp.lower() != "present":
+            params["doctor_registration_number"] = digit_match.group(1)
+            return
+
+    if stamp and stamp.lower() != "present":
+        digit_match = _DOCTOR_REG_DIGITS_RE.search(stamp)
+        if digit_match:
+            params["doctor_registration_number"] = digit_match.group(1)
 
 
 def _is_filled(params: Dict[str, Any], key: str) -> bool:
@@ -553,7 +686,7 @@ def _report_extraction_needs_refine(report_params: Dict[str, Any]) -> bool:
 def _fix_content_classification(data: Dict[str, Any], inv_params: Dict[str, Any]) -> None:
     """Cash memo mislabelled as computer_generated → content is handwritten."""
     doc_type = str(data.get("document_type", "uncertain"))
-    tests = _list_val(inv_params.get("test_details"))
+    tests = _normalize_invoice_detail_list(inv_params.get("test_details"))
     services = _list_val(inv_params.get("service_details"))
     generic_only = bool(services) and all(_is_generic_invoice_service_line(s) for s in services)
     hw = float(data.get("content_handwritten_percent", 0))
@@ -607,10 +740,148 @@ def _apply_document_type(data: Dict[str, Any]) -> str:
     return doc_type
 
 
+def _count_extracted_fields(params: Dict[str, Any]) -> int:
+    count = 0
+    for key, val in params.items():
+        if key == "prescribed_medicines" and isinstance(val, list):
+            count += sum(
+                1
+                for item in val
+                if isinstance(item, dict)
+                and (_str_val(item.get("medicine")) or _str_val(item.get("dosage")))
+            )
+        elif isinstance(val, list):
+            count += len(val)
+        elif _str_val(val):
+            count += 1
+    return count
+
+
+def _non_medical_reason_suggests_bill(data: Dict[str, Any]) -> bool:
+    reason = _str_val(data.get("non_medical_reason")).lower()
+    if not reason:
+        return False
+    return any(hint in reason for hint in _PHARMACY_BILL_HINTS) or "bill" in reason or "invoice" in reason
+
+
+def _invoice_extraction_score(inv: Dict[str, Any]) -> int:
+    score = 0
+    if _is_filled(inv, "patient_name"):
+        score += 2
+    if _is_filled(inv, "total_amount"):
+        score += 2
+    if _is_filled(inv, "invoice_number"):
+        score += 1
+    if _is_filled(inv, "medicine_details"):
+        score += 2
+    if _is_filled(inv, "test_details"):
+        score += 2
+    if _is_filled(inv, "gst_number") or _is_filled(inv, "drug_license_number"):
+        score += 1
+    if _is_filled(inv, "provider_name"):
+        score += 1
+    return score
+
+
+def _recover_medical_classification(data: Dict[str, Any]) -> None:
+    """Undo false 'other' when extraction or reason indicates a real bill/Rx/report."""
+    inv = _normalize_params(
+        data.get("invoice_parameters"), INVOICE_PARAM_KEYS, _INVOICE_ARRAY_KEYS
+    )
+    rx = _normalize_params(
+        data.get("prescription_parameters"),
+        PRESCRIPTION_PARAM_KEYS,
+        frozenset({"advised_tests"}),
+    )
+    rep = _normalize_params(
+        data.get("report_parameters"), REPORT_PARAM_KEYS, _REPORT_ARRAY_KEYS
+    )
+
+    inv_score = _invoice_extraction_score(inv)
+    rx_score = _count_extracted_fields(rx)
+    rep_score = _count_extracted_fields(rep)
+
+    if inv_score >= 3 or (inv_score >= 2 and _is_filled(inv, "medicine_details")):
+        data["is_medical_document"] = True
+        data["document_category"] = "invoice"
+        data["non_medical_reason"] = ""
+        if _is_filled(inv, "medicine_details") or _is_filled(inv, "drug_license_number"):
+            data["invoice_subtype"] = "pharmacy"
+        return
+
+    if rx_score >= 3:
+        data["is_medical_document"] = True
+        data["document_category"] = "prescription"
+        data["invoice_subtype"] = "not_applicable"
+        data["non_medical_reason"] = ""
+        return
+
+    if rep_score >= 3:
+        data["is_medical_document"] = True
+        data["document_category"] = "report"
+        data["invoice_subtype"] = "not_applicable"
+        data["non_medical_reason"] = ""
+        return
+
+    if _non_medical_reason_suggests_bill(data):
+        data["is_medical_document"] = True
+        data["document_category"] = "invoice"
+        data["invoice_subtype"] = "pharmacy"
+        data["non_medical_reason"] = ""
+
+
+def _all_medical_blocks_empty(data: Dict[str, Any]) -> bool:
+    rx = _normalize_params(
+        data.get("prescription_parameters"),
+        PRESCRIPTION_PARAM_KEYS,
+        frozenset({"advised_tests"}),
+    )
+    inv = _normalize_params(
+        data.get("invoice_parameters"), INVOICE_PARAM_KEYS, _INVOICE_ARRAY_KEYS
+    )
+    rep = _normalize_params(
+        data.get("report_parameters"), REPORT_PARAM_KEYS, _REPORT_ARRAY_KEYS
+    )
+    return (
+        _count_extracted_fields(rx) == 0
+        and _count_extracted_fields(inv) == 0
+        and _count_extracted_fields(rep) == 0
+    )
+
+
+def _resolve_non_medical(
+    data: Dict[str, Any], category: str
+) -> Tuple[str, str, bool]:
+    """Return (category, reason, is_medical)."""
+    reason = _str_val(data.get("non_medical_reason"))
+    is_medical = bool(data.get("is_medical_document", True))
+
+    if category == "other":
+        return "other", reason or "Not a medical claim document", False
+
+    if not is_medical and not _non_medical_reason_suggests_bill(data):
+        return (
+            "other",
+            reason or "Image is not a prescription, invoice, or lab report",
+            False,
+        )
+
+    if _all_medical_blocks_empty(data) and not _non_medical_reason_suggests_bill(data):
+        return (
+            "other",
+            reason or "No prescription, bill, or report content found in the image",
+            False,
+        )
+
+    return category, "", True
+
+
 def _build_public_response(url: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    category = str(data.get("document_category", "report"))
-    if category not in ("prescription", "invoice", "report"):
-        category = "report"
+    _recover_medical_classification(data)
+
+    category = str(data.get("document_category", "other"))
+    if category not in _VALID_CATEGORIES:
+        category = "other"
 
     inv_params = _normalize_params(
         data.get("invoice_parameters"), INVOICE_PARAM_KEYS, _INVOICE_ARRAY_KEYS
@@ -620,10 +891,25 @@ def _build_public_response(url: str, data: Dict[str, Any]) -> Dict[str, Any]:
         inv_params = _normalize_params(
             data.get("invoice_parameters"), INVOICE_PARAM_KEYS, _INVOICE_ARRAY_KEYS
         )
-
     doc_type = _apply_document_type(data)
     content_hw, content_cg = _content_percent_split(data)
     category = _correct_document_category(doc_type, category, inv_params)
+    category, non_medical_reason, is_medical = _resolve_non_medical(data, category)
+
+    if not is_medical:
+        return {
+            "url": url,
+            "is_medical_document": False,
+            "document_type": doc_type,
+            "document_category": "other",
+            "invoice_subtype": "not_applicable",
+            "handwritten_percent": content_hw,
+            "computer_generated_percent": content_cg,
+            "completeness_percent": 0.0,
+            "parameters": {},
+            "missing_parameters": ["not_a_medical_document"],
+            "message": non_medical_reason,
+        }
 
     if category == "prescription":
         parameters = _normalize_params(
@@ -631,6 +917,7 @@ def _build_public_response(url: str, data: Dict[str, Any]) -> Dict[str, Any]:
             PRESCRIPTION_PARAM_KEYS,
             frozenset({"advised_tests"}),
         )
+        _normalize_doctor_registration(parameters)
         completeness, missing_parameters = _completeness(
             parameters,
             PRESCRIPTION_REQUIRED,
@@ -680,6 +967,7 @@ def _build_public_response(url: str, data: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "url": url,
+        "is_medical_document": True,
         "document_type": doc_type,
         "document_category": category,
         "invoice_subtype": invoice_subtype,
@@ -688,12 +976,18 @@ def _build_public_response(url: str, data: Dict[str, Any]) -> Dict[str, Any]:
         "completeness_percent": completeness,
         "parameters": parameters,
         "missing_parameters": missing_parameters,
+        "message": "",
     }
 
 
 def _peek_prescription_category(data: Dict[str, Any]) -> str:
+    category = str(data.get("document_category", "other"))
+    if category == "other" or not data.get("is_medical_document", True):
+        return "other"
+    if _all_medical_blocks_empty(data):
+        return "other"
+
     doc_type = str(data.get("document_type", "uncertain"))
-    category = str(data.get("document_category", "report"))
     inv_raw = data.get("invoice_parameters")
     inv = inv_raw if isinstance(inv_raw, dict) else {}
     total = _str_val(inv.get("total_amount"))
@@ -701,12 +995,20 @@ def _peek_prescription_category(data: Dict[str, Any]) -> str:
         if doc_type == "handwritten":
             return "prescription"
         if doc_type == "computer_generated" and not (
-            _list_val(inv.get("test_details")) or _list_val(inv.get("medicine_details"))
+            _is_filled(inv, "test_details") or _is_filled(inv, "medicine_details")
         ):
-            return "report"
-    if category in ("prescription", "invoice", "report"):
+            if _count_extracted_fields(
+                _normalize_params(
+                    data.get("report_parameters"),
+                    REPORT_PARAM_KEYS,
+                    _REPORT_ARRAY_KEYS,
+                )
+            ):
+                return "report"
+            return "other"
+    if category in _VALID_CATEGORIES:
         return category
-    return "report"
+    return "other"
 
 
 def _merge_prescription_medicines(data: Dict[str, Any], refined: Dict[str, Any]) -> None:
@@ -718,6 +1020,9 @@ def _merge_prescription_medicines(data: Dict[str, Any], refined: Dict[str, Any])
         rx["prescribed_medicines"] = refined_meds
     if refined_tests:
         rx["advised_tests"] = refined_tests
+    for key in _PRESCRIPTION_REFINE_STRING_KEYS:
+        _merge_string_field(rx, key, _str_val(refined.get(key)))
+    _normalize_doctor_registration(rx)
     data["prescription_parameters"] = rx
 
 
@@ -728,8 +1033,8 @@ def _merge_diagnostic_invoice(data: Dict[str, Any], refined: Dict[str, Any]) -> 
     for key in _INVOICE_REFINE_STRING_KEYS:
         _merge_string_field(inv, key, _str_val(refined.get(key)))
 
-    tests = _list_val(refined.get("test_details"))
-    medicines = _list_val(refined.get("medicine_details"))
+    tests = _normalize_invoice_detail_list(refined.get("test_details"))
+    medicines = _normalize_invoice_detail_list(refined.get("medicine_details"))
     services = [
         s
         for s in _list_val(refined.get("service_details"))
@@ -757,6 +1062,11 @@ def _merge_diagnostic_invoice(data: Dict[str, Any], refined: Dict[str, Any]) -> 
     if refined.get("content_computer_generated_percent") is not None:
         data["content_computer_generated_percent"] = refined["content_computer_generated_percent"]
 
+    if medicines or _is_filled(inv, "drug_license_number") or _is_filled(inv, "gst_number"):
+        data["invoice_subtype"] = "pharmacy"
+    elif tests and not medicines:
+        data["invoice_subtype"] = "diagnostic"
+
 
 def _merge_lab_report(data: Dict[str, Any], refined: Dict[str, Any]) -> None:
     rep_raw = data.get("report_parameters")
@@ -783,6 +1093,8 @@ def _merge_lab_report(data: Dict[str, Any], refined: Dict[str, Any]) -> None:
 def _peek_report_needs_refine(data: Dict[str, Any]) -> bool:
     if str(data.get("document_category")) != "report":
         return False
+    if not data.get("is_medical_document", True) or _all_medical_blocks_empty(data):
+        return False
     rep_raw = data.get("report_parameters")
     rep = rep_raw if isinstance(rep_raw, dict) else {}
     if str(data.get("document_type")) == "handwritten" and float(
@@ -797,13 +1109,24 @@ def _peek_report_needs_refine(data: Dict[str, Any]) -> bool:
 
 
 def _peek_invoice_needs_refine(data: Dict[str, Any]) -> bool:
+    if _non_medical_reason_suggests_bill(data) and _all_medical_blocks_empty(data):
+        return True
     if str(data.get("document_category")) != "invoice":
+        inv = _normalize_params(
+            data.get("invoice_parameters"), INVOICE_PARAM_KEYS, _INVOICE_ARRAY_KEYS
+        )
+        if _invoice_extraction_score(inv) < 2:
+            return False
+    if not data.get("is_medical_document", True) and not _non_medical_reason_suggests_bill(data):
         return False
     inv_raw = data.get("invoice_parameters")
     inv = inv_raw if isinstance(inv_raw, dict) else {}
     if not _str_val(inv.get("patient_name")):
         return True
-    tests = _list_val(inv.get("test_details"))
+    tests = _normalize_invoice_detail_list(inv.get("test_details"))
+    medicines = _normalize_invoice_detail_list(inv.get("medicine_details"))
+    if medicines:
+        return len(medicines) < 2
     if len(tests) < 2:
         return True
     services = _list_val(inv.get("service_details"))
@@ -912,6 +1235,7 @@ def _call_openai_vision(
         (
             "Classify content type and extract parameters."
             + page_note
+            + " Use document_category=other for app screenshots or non-medical images."
             + " Fill only the matching parameter object."
         ),
         image_blocks,
@@ -932,13 +1256,35 @@ def _refine_prescription_medicines(
         client,
         rx_model,
         PRESCRIPTION_MEDICINE_PROMPT,
-        "List every advised test and every prescribed medicine on this Rx.",
+        "List medicines, advised tests, and doctor registration number from the rubber stamp.",
         image_blocks,
-        "prescription_medicine_extraction",
-        PRESCRIPTION_MEDICINE_SCHEMA,
-        2000,
+        "prescription_refine_extraction",
+        PRESCRIPTION_REFINE_SCHEMA,
+        2500,
     )
     _merge_prescription_medicines(data, refined)
+
+
+def _vision_blocks_high_detail(
+    image_blocks: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Use high detail for invoice line-item extraction (table columns are small)."""
+    blocks: List[Dict[str, Any]] = []
+    for block in image_blocks:
+        if block.get("type") != "image_url":
+            blocks.append(block)
+            continue
+        image_url = block.get("image_url")
+        if not isinstance(image_url, dict):
+            blocks.append(block)
+            continue
+        blocks.append(
+            {
+                "type": "image_url",
+                "image_url": {**image_url, "detail": "high"},
+            }
+        )
+    return blocks
 
 
 def _refine_diagnostic_invoice(
@@ -948,17 +1294,21 @@ def _refine_diagnostic_invoice(
     data: Dict[str, Any],
 ) -> None:
     inv_model = (os.getenv("OPENAI_INVOICE_MODEL") or model).strip()
+    refine_blocks = _vision_blocks_high_detail(image_blocks)
     refined = _call_openai_json(
         client,
         inv_model,
-        DIAGNOSTIC_INVOICE_PROMPT,
-        "Extract content type, patient, doctor, and all test lines with prices.",
-        image_blocks,
-        "diagnostic_invoice_extraction",
+        INVOICE_REFINE_PROMPT,
+        "Extract pharmacy or diagnostic bill fields. Bill of Supply from medical store is a pharmacy invoice.",
+        refine_blocks,
+        "invoice_refine_extraction",
         DIAGNOSTIC_INVOICE_SCHEMA,
-        2000,
+        2500,
     )
     _merge_diagnostic_invoice(data, refined)
+    data["is_medical_document"] = True
+    data["document_category"] = "invoice"
+    _recover_medical_classification(data)
 
 
 def _refine_lab_report(
@@ -987,18 +1337,20 @@ def classify_document_url_openai(url: str) -> Dict[str, Any]:
     client = get_openai_client()
     image_blocks, _ = build_vision_image_blocks(url)
     data = _call_openai_vision(client, model, image_blocks)
-    if _peek_prescription_category(data) == "prescription":
+    _recover_medical_classification(data)
+
+    if _peek_invoice_needs_refine(data):
+        try:
+            _pause_between_openai_calls()
+            _refine_diagnostic_invoice(client, model, image_blocks, data)
+        except Exception:
+            logger.exception("Invoice refine pass failed for %s", url)
+    elif _peek_prescription_category(data) == "prescription":
         try:
             _pause_between_openai_calls()
             _refine_prescription_medicines(client, model, image_blocks, data)
         except Exception:
             logger.exception("Prescription medicine refine pass failed for %s", url)
-    elif _peek_invoice_needs_refine(data):
-        try:
-            _pause_between_openai_calls()
-            _refine_diagnostic_invoice(client, model, image_blocks, data)
-        except Exception:
-            logger.exception("Diagnostic invoice refine pass failed for %s", url)
     elif _peek_report_needs_refine(data):
         try:
             _pause_between_openai_calls()

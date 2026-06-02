@@ -26,7 +26,8 @@ class ReceiptPrescriptionClassifyRequest(BaseModel):
 @router.post("/classify-receipt")
 def classify_receipt_prescription(payload: ReceiptPrescriptionClassifyRequest):
     """
-    For each image URL: document_type (handwritten/computer_generated), document_category,
-    and extracted parameters. Requires OPENAI_API_KEY.
+    For each image URL: document_category (prescription/invoice/report/other),
+    extracted parameters, or rejection when the image is not a medical document.
+    Requires OPENAI_API_KEY.
     """
     return classify_receipt_prescription_urls_controller(payload.urls)
