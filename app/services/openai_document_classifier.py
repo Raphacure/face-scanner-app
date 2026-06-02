@@ -12,7 +12,7 @@ import re
 from typing import Any, Dict, List, Sequence, Tuple
 
 from app.core.openai_client import get_openai_client
-from app.services.document_image_fetch import download_image_data_url
+from app.services.document_image_fetch import build_vision_image_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -816,7 +816,7 @@ def _call_openai_json(
     model: str,
     system: str,
     user_text: str,
-    image_content: Dict[str, Any],
+    image_blocks: List[Dict[str, Any]],
     schema_name: str,
     schema: Dict[str, Any],
     max_tokens: int,
@@ -827,7 +827,7 @@ def _call_openai_json(
             {"role": "system", "content": system},
             {
                 "role": "user",
-                "content": [{"type": "text", "text": user_text}, image_content],
+                "content": [{"type": "text", "text": user_text}, *image_blocks],
             },
         ],
         response_format={
@@ -849,17 +849,23 @@ def _call_openai_json(
 def _call_openai_vision(
     client: Any,
     model: str,
-    image_content: Dict[str, Any],
+    image_blocks: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    page_note = (
+        " Multiple pages attached — read all pages and merge extracted fields."
+        if len(image_blocks) > 1
+        else ""
+    )
     return _call_openai_json(
         client,
         model,
         SYSTEM_PROMPT,
         (
-            "Classify content type and extract parameters. "
-            "Fill only the matching parameter object."
+            "Classify content type and extract parameters."
+            + page_note
+            + " Fill only the matching parameter object."
         ),
-        image_content,
+        image_blocks,
         "medical_document_extraction",
         DOCUMENT_SCHEMA,
         3000,
@@ -869,7 +875,7 @@ def _call_openai_vision(
 def _refine_prescription_medicines(
     client: Any,
     model: str,
-    image_content: Dict[str, Any],
+    image_blocks: List[Dict[str, Any]],
     data: Dict[str, Any],
 ) -> None:
     rx_model = (os.getenv("OPENAI_RX_MODEL") or model).strip()
@@ -878,7 +884,7 @@ def _refine_prescription_medicines(
         rx_model,
         PRESCRIPTION_MEDICINE_PROMPT,
         "List every advised test and every prescribed medicine on this Rx.",
-        image_content,
+        image_blocks,
         "prescription_medicine_extraction",
         PRESCRIPTION_MEDICINE_SCHEMA,
         2000,
@@ -889,7 +895,7 @@ def _refine_prescription_medicines(
 def _refine_diagnostic_invoice(
     client: Any,
     model: str,
-    image_content: Dict[str, Any],
+    image_blocks: List[Dict[str, Any]],
     data: Dict[str, Any],
 ) -> None:
     inv_model = (os.getenv("OPENAI_INVOICE_MODEL") or model).strip()
@@ -898,7 +904,7 @@ def _refine_diagnostic_invoice(
         inv_model,
         DIAGNOSTIC_INVOICE_PROMPT,
         "Extract content type, patient, doctor, and all test lines with prices.",
-        image_content,
+        image_blocks,
         "diagnostic_invoice_extraction",
         DIAGNOSTIC_INVOICE_SCHEMA,
         2000,
@@ -909,7 +915,7 @@ def _refine_diagnostic_invoice(
 def _refine_lab_report(
     client: Any,
     model: str,
-    image_content: Dict[str, Any],
+    image_blocks: List[Dict[str, Any]],
     data: Dict[str, Any],
 ) -> None:
     report_model = (os.getenv("OPENAI_REPORT_MODEL") or model).strip()
@@ -918,7 +924,7 @@ def _refine_lab_report(
         report_model,
         LAB_REPORT_PROMPT,
         "Classify printed vs handwritten content and extract lab test fields.",
-        image_content,
+        image_blocks,
         "lab_report_extraction",
         LAB_REPORT_SCHEMA,
         2000,
@@ -930,25 +936,21 @@ def classify_document_url_openai(url: str) -> Dict[str, Any]:
     """Classify one image URL and return category-specific extracted parameters."""
     model = (os.getenv("OPENAI_MODEL") or DEFAULT_MODEL).strip()
     client = get_openai_client()
-    data_url, _ = download_image_data_url(url)
-    image_content = {
-        "type": "image_url",
-        "image_url": {"url": data_url, "detail": "high"},
-    }
-    data = _call_openai_vision(client, model, image_content)
+    image_blocks, _ = build_vision_image_blocks(url)
+    data = _call_openai_vision(client, model, image_blocks)
     if _peek_prescription_category(data) == "prescription":
         try:
-            _refine_prescription_medicines(client, model, image_content, data)
+            _refine_prescription_medicines(client, model, image_blocks, data)
         except Exception:
             logger.exception("Prescription medicine refine pass failed for %s", url)
     elif _peek_invoice_needs_refine(data):
         try:
-            _refine_diagnostic_invoice(client, model, image_content, data)
+            _refine_diagnostic_invoice(client, model, image_blocks, data)
         except Exception:
             logger.exception("Diagnostic invoice refine pass failed for %s", url)
     elif _peek_report_needs_refine(data):
         try:
-            _refine_lab_report(client, model, image_content, data)
+            _refine_lab_report(client, model, image_blocks, data)
         except Exception:
             logger.exception("Lab report refine pass failed for %s", url)
     return _build_public_response(url, data)

@@ -13,13 +13,13 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 
 
 class ReceiptPrescriptionClassifyRequest(BaseModel):
-    """Public image URLs of medical documents to classify via OpenAI Vision."""
+    """Public image URLs of medical documents (JPEG/PNG/WebP or PDF) to classify via OpenAI Vision."""
 
     urls: List[str] = Field(
         ...,
         min_length=1,
         max_length=MAX_URLS,
-        description="Publicly reachable image URLs (e.g. PNG/JPEG).",
+        description="Publicly reachable image or PDF URLs.",
     )
 
 
