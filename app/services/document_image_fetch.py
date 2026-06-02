@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import os
 from typing import Any, Dict, List, Tuple
 
 import requests
@@ -12,6 +13,12 @@ MAX_RENDERED_PAGE_BYTES = 5 * 1024 * 1024
 MAX_PDF_PAGES = 5
 PDF_RENDER_DPI = 144
 REQUEST_TIMEOUT_S = 30
+_VALID_IMAGE_DETAIL = frozenset({"auto", "low", "high"})
+
+
+def _vision_image_detail() -> str:
+    detail = (os.getenv("OPENAI_IMAGE_DETAIL") or "auto").strip().lower()
+    return detail if detail in _VALID_IMAGE_DETAIL else "auto"
 
 
 def _download_bytes(url: str) -> bytes:
@@ -108,11 +115,12 @@ def download_image_data_url(url: str) -> Tuple[str, bytes]:
 
 def build_vision_image_blocks(url: str) -> Tuple[List[Dict[str, Any]], bytes]:
     """OpenAI Vision content blocks (one block per PDF page or single image)."""
+    detail = _vision_image_detail()
     data_urls, raw = download_document_data_urls(url)
     blocks = [
         {
             "type": "image_url",
-            "image_url": {"url": data_url, "detail": "high"},
+            "image_url": {"url": data_url, "detail": detail},
         }
         for data_url in data_urls
     ]

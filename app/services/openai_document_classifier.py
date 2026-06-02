@@ -9,7 +9,10 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Sequence, Tuple
+
+from openai import APIStatusError, RateLimitError
 
 from app.core.openai_client import get_openai_client
 from app.services.document_image_fetch import build_vision_image_blocks
@@ -17,6 +20,8 @@ from app.services.document_image_fetch import build_vision_image_blocks
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MAX_RETRIES = max(1, int(os.getenv("OPENAI_MAX_RETRIES", "6")))
+OPENAI_INTER_CALL_DELAY_MS = max(0, int(os.getenv("OPENAI_INTER_CALL_DELAY_MS", "400")))
 
 _STRING_ARRAY = {"type": "array", "items": {"type": "string"}}
 
@@ -811,6 +816,26 @@ def _peek_invoice_needs_refine(data: Dict[str, Any]) -> bool:
     return False
 
 
+def _retry_wait_seconds(error: Exception, attempt: int) -> float:
+    """Parse OpenAI 'try again in Xms' or use exponential backoff."""
+    message = str(error)
+    match_ms = re.search(r"try again in (\d+(?:\.\d+)?)\s*ms", message, re.IGNORECASE)
+    if match_ms:
+        return float(match_ms.group(1)) / 1000.0 + 0.05
+    match_s = re.search(r"try again in (\d+(?:\.\d+)?)\s*s", message, re.IGNORECASE)
+    if match_s:
+        return float(match_s.group(1)) + 0.05
+    return min(60.0, 0.5 * (2**attempt))
+
+
+def _is_rate_limit_error(error: Exception) -> bool:
+    if isinstance(error, RateLimitError):
+        return True
+    if isinstance(error, APIStatusError) and error.status_code == 429:
+        return True
+    return "rate_limit" in str(error).lower() or "429" in str(error)
+
+
 def _call_openai_json(
     client: Any,
     model: str,
@@ -821,29 +846,53 @@ def _call_openai_json(
     schema: Dict[str, Any],
     max_tokens: int,
 ) -> Dict[str, Any]:
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": user_text}, *image_blocks],
-            },
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {"name": schema_name, "strict": True, "schema": schema},
-        },
-        temperature=0.0,
-        max_tokens=max_tokens,
-    )
-    content = response.choices[0].message.content
-    if not content:
-        raise ValueError("Empty response from OpenAI")
-    parsed = json.loads(content)
-    if not isinstance(parsed, dict):
-        raise ValueError("OpenAI response is not a JSON object")
-    return parsed
+    last_error: Exception | None = None
+    for attempt in range(OPENAI_MAX_RETRIES):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": user_text}, *image_blocks],
+                    },
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": schema_name, "strict": True, "schema": schema},
+                },
+                temperature=0.0,
+                max_tokens=max_tokens,
+            )
+            content = response.choices[0].message.content
+            if not content:
+                raise ValueError("Empty response from OpenAI")
+            parsed = json.loads(content)
+            if not isinstance(parsed, dict):
+                raise ValueError("OpenAI response is not a JSON object")
+            return parsed
+        except Exception as exc:
+            last_error = exc
+            if not _is_rate_limit_error(exc) or attempt >= OPENAI_MAX_RETRIES - 1:
+                raise
+            wait = _retry_wait_seconds(exc, attempt)
+            logger.warning(
+                "OpenAI rate limit on %s (attempt %s/%s), retrying in %.2fs",
+                schema_name,
+                attempt + 1,
+                OPENAI_MAX_RETRIES,
+                wait,
+            )
+            time.sleep(wait)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("OpenAI call failed without error detail")
+
+
+def _pause_between_openai_calls() -> None:
+    if OPENAI_INTER_CALL_DELAY_MS > 0:
+        time.sleep(OPENAI_INTER_CALL_DELAY_MS / 1000.0)
 
 
 def _call_openai_vision(
@@ -940,16 +989,19 @@ def classify_document_url_openai(url: str) -> Dict[str, Any]:
     data = _call_openai_vision(client, model, image_blocks)
     if _peek_prescription_category(data) == "prescription":
         try:
+            _pause_between_openai_calls()
             _refine_prescription_medicines(client, model, image_blocks, data)
         except Exception:
             logger.exception("Prescription medicine refine pass failed for %s", url)
     elif _peek_invoice_needs_refine(data):
         try:
+            _pause_between_openai_calls()
             _refine_diagnostic_invoice(client, model, image_blocks, data)
         except Exception:
             logger.exception("Diagnostic invoice refine pass failed for %s", url)
     elif _peek_report_needs_refine(data):
         try:
+            _pause_between_openai_calls()
             _refine_lab_report(client, model, image_blocks, data)
         except Exception:
             logger.exception("Lab report refine pass failed for %s", url)
