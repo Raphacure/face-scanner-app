@@ -133,6 +133,16 @@ _DOCTOR_REG_IN_TEXT_RE = re.compile(
 )
 _DOCTOR_REG_DIGITS_RE = re.compile(r"\b(\d{4,6}(?:/\d{2,6})?)\b")
 
+# Indian pharmacy bill header identifiers (GSTIN + state drug license).
+_GSTIN_RE = re.compile(
+    r"\b(\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d])\b",
+    re.IGNORECASE,
+)
+_DRUG_LICENSE_RE = re.compile(
+    r"(?:DL\s*NO\.?\s*(?:\d+)?\s*[:\s#-]*)?(\d{1,2}-DRUG/\d{4}-\d{2,4}/\d+)",
+    re.IGNORECASE,
+)
+
 # Pattern heuristics for printed form rows / section titles (not fixed test-name lists).
 _INVOICE_PRINTED_ROW_RE = re.compile(
     r"^(?:\d+[\).:\s-]+)?"
@@ -242,6 +252,10 @@ Rx without rupee total → prescription, NEVER invoice.
 invoice_subtype (invoice only): pharmacy | diagnostic | opd_consultation | uncertain | not_applicable.
 
 Invoice / pharmacy bill: medicine_details[] as product name strings (full PRODUCT NAME & PACKING per row).
+Pharmacy / chemist / Bill of Supply: read the TOP header for gst_number (GST NO., GSTIN — 15 chars, e.g. 08DBMPS6924P1ZK)
+and drug_license_number (all DL NO. lines; join multiple with "; "). Do not leave these empty when printed on the bill.
+Pharmacy footer: scan bottom-right for authorized_stamp (shop/pharmacist/proprietor rubber stamp text) and
+authorized_signature (handwritten sign). Use "present" when visible but illegible. Fill at least one when shown on bill.
 Diagnostic bill: test_details[] as "Test name — Rs amount" per line.
 Prescription: all medicines as {medicine,dosage}; advised_tests for labs only.
 doctor_registration_number: read from rubber stamp, letterhead, or printed text (RMC No., Reg No., MCI, MMC — e.g. "70486/29204"). NOT empty if visible in stamp.
@@ -332,12 +346,17 @@ CONTENT: document_type and content_handwritten_percent / content_computer_genera
 Pharmacy / Bill of Supply:
 - invoice_subtype=pharmacy
 - provider_name, provider_address, patient_name, invoice_number, invoice_date, total_amount
-- gst_number, drug_license_number (DL No.)
+- gst_number: copy GST NO. / GSTIN from top of bill exactly (15-character alphanumeric).
+- drug_license_number: every DL NO. line (DL NO.20, DL NO.21, etc.); join with "; " if multiple.
+  Scan the full top margin — these are often small text above the store name.
 - medicine_details[]: one string per medicine row (product name and packing as printed)
-- authorized_stamp or authorized_signature (pharmacist stamp/signature counts)
+- authorized_stamp: bottom/footer shop stamp — copy readable text (store name, Proprietor, Pharmacist, etc.).
+- authorized_signature: handwritten signature at footer; use "present" if signed but not readable.
+  At least one must be filled when stamp or signature appears on the bill (common bottom-right on pharmacy bills).
 - doctor_name if "Prescribed by" shown (optional)
 
-Diagnostic bill: test_details[] with test and price per line. OPD: service_details consultation fee."""
+Diagnostic bill: test_details[] with test and price per line. OPD: service_details consultation fee.
+Diagnostic/lab bills: authorized_stamp = lab seal text; authorized_signature = signatory signature or "present"."""
 
 _REPORT_REFINE_STRING_KEYS = (
     "patient_name",
@@ -558,6 +577,74 @@ def _normalize_doctor_registration(params: Dict[str, Any]) -> None:
         digit_match = _DOCTOR_REG_DIGITS_RE.search(stamp)
         if digit_match:
             params["doctor_registration_number"] = digit_match.group(1)
+
+
+def _looks_like_pharmacy_invoice(inv: Dict[str, Any], data: Dict[str, Any]) -> bool:
+    subtype = str(data.get("invoice_subtype", ""))
+    if subtype == "pharmacy":
+        return True
+    if _is_filled(inv, "medicine_details"):
+        return True
+    if _is_filled(inv, "drug_license_number") or _is_filled(inv, "gst_number"):
+        return True
+    blob = " ".join(
+        _str_val(inv.get(key))
+        for key in ("provider_name", "provider_address", "authorized_stamp")
+    ).lower()
+    return any(
+        hint in blob
+        for hint in (
+            "medical store",
+            "chemist",
+            "pharmacy",
+            "bill of supply",
+            "pharmacist",
+            "drug license",
+            "dl no",
+            "gst no",
+        )
+    )
+
+
+def _pharmacy_regulatory_incomplete(inv: Dict[str, Any]) -> bool:
+    return not _is_filled(inv, "gst_number") or not _is_filled(inv, "drug_license_number")
+
+
+def _invoice_authorization_missing(inv: Dict[str, Any]) -> bool:
+    """Stamp or signature at bill footer — either counts when visible."""
+    return not _is_filled(inv, "authorized_stamp") and not _is_filled(
+        inv, "authorized_signature"
+    )
+
+
+def _pharmacy_invoice_needs_refine(inv: Dict[str, Any]) -> bool:
+    return _pharmacy_regulatory_incomplete(inv) or _invoice_authorization_missing(inv)
+
+
+def _normalize_pharmacy_regulatory_ids(params: Dict[str, Any]) -> None:
+    """Fill gst_number / drug_license_number from header text when the model skipped them."""
+    scan_parts = [
+        _str_val(params.get("gst_number")),
+        _str_val(params.get("drug_license_number")),
+        _str_val(params.get("provider_name")),
+        _str_val(params.get("provider_address")),
+        _str_val(params.get("authorized_stamp")),
+    ]
+    blob = " ".join(part for part in scan_parts if part)
+
+    if not _is_filled(params, "gst_number") and blob:
+        match = _GSTIN_RE.search(blob)
+        if match:
+            params["gst_number"] = match.group(1).upper()
+
+    if not _is_filled(params, "drug_license_number") and blob:
+        licenses = [m.group(1) for m in _DRUG_LICENSE_RE.finditer(blob)]
+        if licenses:
+            seen: List[str] = []
+            for lic in licenses:
+                if lic not in seen:
+                    seen.append(lic)
+            params["drug_license_number"] = "; ".join(seen)
 
 
 def _is_filled(params: Dict[str, Any], key: str) -> bool:
@@ -937,6 +1024,8 @@ def _build_public_response(url: str, data: Dict[str, Any]) -> Dict[str, Any]:
         invoice_subtype = "not_applicable"
     elif category == "invoice":
         parameters = inv_params
+        if _looks_like_pharmacy_invoice(parameters, data):
+            _normalize_pharmacy_regulatory_ids(parameters)
         completeness, missing_parameters = _completeness(
             parameters,
             INVOICE_REQUIRED,
@@ -1053,6 +1142,7 @@ def _merge_diagnostic_invoice(data: Dict[str, Any], refined: Dict[str, Any]) -> 
             if not _is_generic_invoice_service_line(s)
         ]
 
+    _normalize_pharmacy_regulatory_ids(inv)
     data["invoice_parameters"] = inv
 
     if _str_val(refined.get("document_type")):
@@ -1125,8 +1215,14 @@ def _peek_invoice_needs_refine(data: Dict[str, Any]) -> bool:
         return True
     tests = _normalize_invoice_detail_list(inv.get("test_details"))
     medicines = _normalize_invoice_detail_list(inv.get("medicine_details"))
+    if medicines and len(medicines) >= 2:
+        if _looks_like_pharmacy_invoice(inv, data) and _pharmacy_invoice_needs_refine(inv):
+            return True
+        if _invoice_authorization_missing(inv):
+            return True
+        return False
     if medicines:
-        return len(medicines) < 2
+        return True
     if len(tests) < 2:
         return True
     services = _list_val(inv.get("service_details"))
@@ -1299,7 +1395,12 @@ def _refine_diagnostic_invoice(
         client,
         inv_model,
         INVOICE_REFINE_PROMPT,
-        "Extract pharmacy or diagnostic bill fields. Bill of Supply from medical store is a pharmacy invoice.",
+        (
+            "Extract pharmacy or diagnostic bill fields. Bill of Supply from medical store "
+            "is a pharmacy invoice. Read top header for GST NO./GSTIN and every DL NO. "
+            "line; copy exactly. Scan bill footer (bottom-right) for pharmacist/shop stamp "
+            "and handwritten signature — fill authorized_stamp and/or authorized_signature."
+        ),
         refine_blocks,
         "invoice_refine_extraction",
         DIAGNOSTIC_INVOICE_SCHEMA,
