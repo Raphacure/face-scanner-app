@@ -125,3 +125,67 @@ def build_vision_image_blocks(url: str) -> Tuple[List[Dict[str, Any]], bytes]:
         for data_url in data_urls
     ]
     return blocks, raw
+
+
+def _header_crop_top_ratio() -> float:
+    try:
+        ratio = float(os.getenv("PHARMACY_HEADER_CROP_RATIO", "0.38"))
+    except ValueError:
+        ratio = 0.38
+    return max(0.15, min(0.55, ratio))
+
+
+def build_header_crop_data_url(image_bytes: bytes) -> str | None:
+    """Crop top band of a bill image — GST/DL are often printed in this margin."""
+    if _is_pdf(image_bytes):
+        return None
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+
+    height = img.shape[0]
+    crop_height = max(1, int(height * _header_crop_top_ratio()))
+    top_band = img[0:crop_height, :]
+    ok, encoded = cv2.imencode(".jpg", top_band, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+    if not ok:
+        return None
+    return _data_url_from_bytes(encoded.tobytes(), "image/jpeg")
+
+
+def build_regulatory_header_blocks(
+    image_blocks: List[Dict[str, Any]],
+    document_raw: bytes,
+) -> List[Dict[str, Any]]:
+    """Full bill (high detail) plus optional top-header crop for GST/DL extraction."""
+    blocks = []
+    for block in image_blocks:
+        if block.get("type") != "image_url":
+            blocks.append(block)
+            continue
+        image_url = block.get("image_url")
+        if not isinstance(image_url, dict):
+            blocks.append(block)
+            continue
+        blocks.append(
+            {
+                "type": "image_url",
+                "image_url": {**image_url, "detail": "high"},
+            }
+        )
+
+    crop_url = build_header_crop_data_url(document_raw)
+    if crop_url:
+        blocks.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": crop_url, "detail": "high"},
+            }
+        )
+    return blocks
