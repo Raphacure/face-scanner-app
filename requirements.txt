@@ -5,6 +5,7 @@ python-multipart
 numpy
 scipy
 opencv-python
+Pillow>=10.0.0
 mediapipe
 
 reportlab

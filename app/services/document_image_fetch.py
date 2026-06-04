@@ -159,13 +159,61 @@ class DocumentPages:
     def is_pdf(self) -> bool:
         return is_pdf_bytes(self.raw)
 
+    def with_rotation(self, degrees: int) -> "DocumentPages":
+        return DocumentPages(
+            raw=self.raw,
+            page_images=[rotate_image_bytes(page, degrees) for page in self.page_images],
+        )
+
+
+def normalize_image_orientation(image_bytes: bytes) -> bytes:
+    """Apply EXIF orientation when present (common for phone camera uploads)."""
+    try:
+        from PIL import Image, ImageOps
+        import io
+
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            im = ImageOps.exif_transpose(im)
+            out = io.BytesIO()
+            im.convert("RGB").save(out, format="JPEG", quality=90)
+            return out.getvalue()
+    except Exception:
+        return image_bytes
+
+
+def rotate_image_bytes(image_bytes: bytes, degrees: int) -> bytes:
+    """Rotate image for upside-down / sideways uploads (degrees: 90, 180, 270)."""
+    if degrees not in (90, 180, 270):
+        return image_bytes
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return image_bytes
+
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return image_bytes
+
+    if degrees == 90:
+        img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    elif degrees == 180:
+        img = cv2.rotate(img, cv2.ROTATE_180)
+    else:
+        img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    ok, encoded = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    return encoded.tobytes() if ok else image_bytes
+
 
 def load_document(url: str) -> DocumentPages:
     raw = _download_bytes(url)
     if is_pdf_bytes(raw):
         max_render = max(pdf_vision_max_pages(), pdf_refine_max_pages())
         return DocumentPages(raw=raw, page_images=render_pdf_page_images(raw, max_render))
-    return DocumentPages(raw=raw, page_images=[raw])
+    oriented = normalize_image_orientation(raw)
+    return DocumentPages(raw=raw, page_images=[oriented])
 
 
 def _blocks_from_page_bytes(

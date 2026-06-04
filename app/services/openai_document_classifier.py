@@ -249,6 +249,23 @@ _PHARMACY_BILL_HINTS = frozenset(
     }
 )
 
+_MEDICAL_CLAIM_HINTS = _PHARMACY_BILL_HINTS | frozenset(
+    {
+        "consultation",
+        "clinic",
+        "received with thanks",
+        "physician",
+        "doctor",
+        "receipt",
+        "hospital",
+        "opd",
+        "mbbs",
+        "rotated",
+        "upside",
+        "inverted",
+    }
+)
+
 
 def _param_object_schema(
     keys: Sequence[str],
@@ -298,11 +315,14 @@ Do NOT mark fully printed pharmacy receipts as handwritten because of a signatur
 document_category:
 - prescription | invoice | report — valid medical claim documents for insurance.
 - pharmacy/chemist Bill of Supply, tax invoice, cash memo from medical store ARE invoices (is_medical_document=true, invoice_subtype=pharmacy).
-- diagnostic center bills → invoice_subtype=diagnostic. Hospital OPD bills → opd_consultation.
+- diagnostic center bills → invoice_subtype=diagnostic.
+- Doctor/clinic consultation receipts ("Received with thanks", OPD fee, cash memo from clinic) → invoice, invoice_subtype=opd_consultation.
 - other — ONLY for non-documents: app screenshots, error popups, phone UI, selfies, blank/unreadable images.
-  Do NOT mark pharmacy bills or hospital bills as other.
+  Do NOT mark pharmacy bills, clinic receipts, or hospital bills as other.
 
-is_medical_document=true for Rx, pharmacy bill, diagnostic bill, lab report.
+Orientation: photos may be upside-down or sideways — still read and classify. Rotated clinic/bill/Rx photos ARE medical documents.
+
+is_medical_document=true for Rx, pharmacy bill, diagnostic bill, lab report, doctor consultation receipt.
 
 Rx without rupee total → prescription, NEVER invoice.
 
@@ -1141,7 +1161,76 @@ def _non_medical_reason_suggests_bill(data: Dict[str, Any]) -> bool:
     reason = _str_val(data.get("non_medical_reason")).lower()
     if not reason:
         return False
-    return any(hint in reason for hint in _PHARMACY_BILL_HINTS) or "bill" in reason or "invoice" in reason
+    return (
+        any(hint in reason for hint in _MEDICAL_CLAIM_HINTS)
+        or "bill" in reason
+        or "invoice" in reason
+        or "receipt" in reason
+    )
+
+
+def _looks_like_opd_consultation_invoice(inv: Dict[str, Any]) -> bool:
+    if not _is_filled(inv, "total_amount") or not _is_filled(inv, "patient_name"):
+        return False
+    return (
+        _is_filled(inv, "provider_name")
+        or _is_filled(inv, "doctor_name")
+        or _is_filled(inv, "service_details")
+        or _is_filled(inv, "invoice_number")
+    )
+
+
+def _medical_extraction_score(data: Dict[str, Any]) -> int:
+    inv = _normalize_params(
+        data.get("invoice_parameters"), INVOICE_PARAM_KEYS, _INVOICE_ARRAY_KEYS
+    )
+    rx = _normalize_params(
+        data.get("prescription_parameters"),
+        PRESCRIPTION_PARAM_KEYS,
+        frozenset({"advised_tests"}),
+    )
+    rep = _normalize_params(
+        data.get("report_parameters"), REPORT_PARAM_KEYS, _REPORT_ARRAY_KEYS
+    )
+    return max(
+        _invoice_extraction_score(inv),
+        _count_extracted_fields(rx),
+        _count_extracted_fields(rep),
+    )
+
+
+def _needs_orientation_retry(data: Dict[str, Any]) -> bool:
+    """Re-classify rotated 180° when first pass returned other / empty."""
+    category = str(data.get("document_category", "other"))
+    if category == "other":
+        return True
+    if not data.get("is_medical_document", True) and _all_medical_blocks_empty(data):
+        return True
+    if _all_medical_blocks_empty(data) and category in ("invoice", "prescription", "report"):
+        return True
+    return False
+
+
+def _pick_better_classification(
+    original: Dict[str, Any], rotated: Dict[str, Any]
+) -> Tuple[Dict[str, Any], bool]:
+    """Return (best_data, used_rotated)."""
+    score_orig = _medical_extraction_score(original)
+    score_rot = _medical_extraction_score(rotated)
+    cat_orig = str(original.get("document_category", "other"))
+    cat_rot = str(rotated.get("document_category", "other"))
+
+    if score_rot > score_orig:
+        return rotated, True
+    if score_rot < score_orig:
+        return original, False
+    if cat_orig == "other" and cat_rot != "other":
+        return rotated, True
+    if cat_rot == "other" and cat_orig != "other":
+        return original, False
+    if rotated.get("is_medical_document") and not original.get("is_medical_document"):
+        return rotated, True
+    return original, False
 
 
 def _invoice_extraction_score(inv: Dict[str, Any]) -> int:
@@ -1187,6 +1276,15 @@ def _recover_medical_classification(data: Dict[str, Any]) -> None:
         data["non_medical_reason"] = ""
         if _is_filled(inv, "medicine_details") or _is_filled(inv, "drug_license_number"):
             data["invoice_subtype"] = "pharmacy"
+        elif _looks_like_opd_consultation_invoice(inv):
+            data["invoice_subtype"] = "opd_consultation"
+        return
+
+    if inv_score >= 2 and _looks_like_opd_consultation_invoice(inv):
+        data["is_medical_document"] = True
+        data["document_category"] = "invoice"
+        data["invoice_subtype"] = "opd_consultation"
+        data["non_medical_reason"] = ""
         return
 
     if rx_score >= 3:
@@ -1206,7 +1304,11 @@ def _recover_medical_classification(data: Dict[str, Any]) -> None:
     if _non_medical_reason_suggests_bill(data):
         data["is_medical_document"] = True
         data["document_category"] = "invoice"
-        data["invoice_subtype"] = "pharmacy"
+        reason = _str_val(data.get("non_medical_reason")).lower()
+        if any(h in reason for h in ("consultation", "clinic", "opd", "doctor", "physician")):
+            data["invoice_subtype"] = "opd_consultation"
+        else:
+            data["invoice_subtype"] = "pharmacy"
         data["non_medical_reason"] = ""
 
 
@@ -1661,6 +1763,34 @@ def _call_openai_vision(
     )
 
 
+def _call_openai_vision_rotated(
+    client: Any,
+    model: str,
+    image_blocks: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    page_note = (
+        " Multiple pages attached — read all pages and merge extracted fields."
+        if len(image_blocks) > 1
+        else ""
+    )
+    return _call_openai_json(
+        client,
+        model,
+        SYSTEM_PROMPT,
+        (
+            "The document photo may be upside-down or sideways — read text in any orientation."
+            + " Classify content type and extract parameters."
+            + page_note
+            + " Clinic/doctor consultation receipts are invoice (opd_consultation)."
+            + " Fill only the matching parameter object."
+        ),
+        image_blocks,
+        "medical_document_extraction_rotated",
+        DOCUMENT_SCHEMA,
+        2200,
+    )
+
+
 def _refine_prescription_medicines(
     client: Any,
     model: str,
@@ -1846,6 +1976,21 @@ def classify_document_url_openai(url: str) -> Dict[str, Any]:
     image_blocks = build_vision_blocks_from_document(doc)
     data = _call_openai_vision(client, model, image_blocks)
     _recover_medical_classification(data)
+
+    used_rotated = False
+    if _needs_orientation_retry(data) and not doc.is_pdf and doc.page_images:
+        try:
+            _pause_between_openai_calls()
+            doc_rot = doc.with_rotation(180)
+            blocks_rot = build_vision_blocks_from_document(doc_rot)
+            data_rot = _call_openai_vision_rotated(client, model, blocks_rot)
+            _recover_medical_classification(data_rot)
+            data, used_rotated = _pick_better_classification(data, data_rot)
+            if used_rotated:
+                doc = doc_rot
+                image_blocks = blocks_rot
+        except Exception:
+            logger.exception("Orientation retry failed for %s", url)
 
     if _peek_invoice_needs_refine(data):
         try:
