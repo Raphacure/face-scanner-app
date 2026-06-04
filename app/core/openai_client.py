@@ -15,7 +15,11 @@ def get_openai_client() -> OpenAI:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set")
     if _client is None:
-        _client = OpenAI(api_key=api_key)
+        try:
+            timeout_s = float(os.getenv("OPENAI_REQUEST_TIMEOUT_S", "180"))
+        except ValueError:
+            timeout_s = 180.0
+        _client = OpenAI(api_key=api_key, timeout=timeout_s)
     return _client
 
 
