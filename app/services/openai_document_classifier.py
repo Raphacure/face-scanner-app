@@ -16,16 +16,19 @@ from openai import APIStatusError, RateLimitError
 
 from app.core.openai_client import get_openai_client
 from app.services.document_image_fetch import (
-    build_header_crop_data_url,
+    DocumentPages,
+    build_header_crop_from_document,
+    build_refine_image_blocks,
     build_regulatory_header_blocks,
-    build_vision_image_blocks,
+    build_vision_blocks_from_document,
+    load_document,
 )
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_MAX_RETRIES = max(1, int(os.getenv("OPENAI_MAX_RETRIES", "6")))
-OPENAI_INTER_CALL_DELAY_MS = max(0, int(os.getenv("OPENAI_INTER_CALL_DELAY_MS", "400")))
+OPENAI_INTER_CALL_DELAY_MS = max(0, int(os.getenv("OPENAI_INTER_CALL_DELAY_MS", "0")))
 
 _STRING_ARRAY = {"type": "array", "items": {"type": "string"}}
 
@@ -783,6 +786,13 @@ def _pharmacy_regulatory_invalid(inv: Dict[str, Any]) -> bool:
     return not gst or not dl
 
 
+def _pharmacy_gst_only_missing(inv: Dict[str, Any]) -> bool:
+    """DL already extracted — only GSTIN still missing (skip full regulatory pass)."""
+    if _extract_gstin(_str_val(inv.get("gst_number"))):
+        return False
+    return bool(_extract_drug_licenses(_str_val(inv.get("drug_license_number"))))
+
+
 def _pharmacy_regulatory_incomplete(inv: Dict[str, Any]) -> bool:
     return _pharmacy_regulatory_invalid(inv)
 
@@ -1518,6 +1528,8 @@ def _peek_invoice_needs_refine(data: Dict[str, Any]) -> bool:
     tests = _normalize_invoice_detail_list(inv.get("test_details"))
     medicines = _normalize_invoice_detail_list(inv.get("medicine_details"))
     if medicines and len(medicines) >= 2:
+        if _pharmacy_regulatory_invalid(inv) or _invoice_authorization_missing(inv):
+            return True
         return False
     if medicines:
         return True
@@ -1645,7 +1657,7 @@ def _call_openai_vision(
         image_blocks,
         "medical_document_extraction",
         DOCUMENT_SCHEMA,
-        3000,
+        2200,
     )
 
 
@@ -1654,14 +1666,19 @@ def _refine_prescription_medicines(
     model: str,
     image_blocks: List[Dict[str, Any]],
     data: Dict[str, Any],
+    document_raw: bytes | None = None,
+    doc: DocumentPages | None = None,
 ) -> None:
     rx_model = (os.getenv("OPENAI_RX_MODEL") or model).strip()
+    refine_blocks = build_refine_image_blocks(
+        image_blocks, document_raw or (doc.raw if doc else b""), detail="high", doc=doc
+    )
     refined = _call_openai_json(
         client,
         rx_model,
         PRESCRIPTION_MEDICINE_PROMPT,
         "List medicines, advised tests, and doctor registration number from the rubber stamp.",
-        image_blocks,
+        refine_blocks,
         "prescription_refine_extraction",
         PRESCRIPTION_REFINE_SCHEMA,
         2500,
@@ -1669,26 +1686,17 @@ def _refine_prescription_medicines(
     _merge_prescription_medicines(data, refined)
 
 
-def _vision_blocks_high_detail(
+def _invoice_refine_blocks(
     image_blocks: List[Dict[str, Any]],
+    document_raw: bytes,
+    data: Dict[str, Any],
+    doc: DocumentPages | None,
 ) -> List[Dict[str, Any]]:
-    """Use high detail for invoice line-item extraction (table columns are small)."""
-    blocks: List[Dict[str, Any]] = []
-    for block in image_blocks:
-        if block.get("type") != "image_url":
-            blocks.append(block)
-            continue
-        image_url = block.get("image_url")
-        if not isinstance(image_url, dict):
-            blocks.append(block)
-            continue
-        blocks.append(
-            {
-                "type": "image_url",
-                "image_url": {**image_url, "detail": "high"},
-            }
-        )
-    return blocks
+    inv_raw = data.get("invoice_parameters")
+    inv = inv_raw if isinstance(inv_raw, dict) else {}
+    if _looks_like_pharmacy_invoice(inv, data):
+        return build_regulatory_header_blocks(image_blocks, document_raw, doc=doc)
+    return build_refine_image_blocks(image_blocks, document_raw, detail="high", doc=doc)
 
 
 def _refine_diagnostic_invoice(
@@ -1696,9 +1704,12 @@ def _refine_diagnostic_invoice(
     model: str,
     image_blocks: List[Dict[str, Any]],
     data: Dict[str, Any],
+    document_raw: bytes | None = None,
+    doc: DocumentPages | None = None,
 ) -> None:
     inv_model = (os.getenv("OPENAI_INVOICE_MODEL") or model).strip()
-    refine_blocks = _vision_blocks_high_detail(image_blocks)
+    raw = document_raw or (doc.raw if doc else b"")
+    refine_blocks = _invoice_refine_blocks(image_blocks, raw, data, doc)
     refined = _call_openai_json(
         client,
         inv_model,
@@ -1711,7 +1722,7 @@ def _refine_diagnostic_invoice(
         refine_blocks,
         "invoice_refine_extraction",
         DIAGNOSTIC_INVOICE_SCHEMA,
-        2500,
+        1800,
     )
     _merge_diagnostic_invoice(data, refined)
     data["is_medical_document"] = True
@@ -1719,23 +1730,15 @@ def _refine_diagnostic_invoice(
     _recover_medical_classification(data)
 
 
-def _regulatory_vision_blocks(
-    image_blocks: List[Dict[str, Any]],
-    document_raw: bytes | None,
-) -> List[Dict[str, Any]]:
-    if document_raw:
-        return build_regulatory_header_blocks(image_blocks, document_raw)
-    return _vision_blocks_high_detail(image_blocks)
-
-
 def _refine_pharmacy_gst_header(
     client: Any,
     model: str,
     document_raw: bytes,
     data: Dict[str, Any],
+    doc: DocumentPages | None = None,
 ) -> None:
     """GST-only pass on top-header crop when full-bill passes found DL but missed GSTIN."""
-    crop_url = build_header_crop_data_url(document_raw)
+    crop_url = build_header_crop_from_document(document_raw, doc=doc)
     if not crop_url:
         return
 
@@ -1773,11 +1776,13 @@ def _refine_pharmacy_regulatory(
     image_blocks: List[Dict[str, Any]],
     data: Dict[str, Any],
     document_raw: bytes | None = None,
+    doc: DocumentPages | None = None,
 ) -> None:
-    """Pass focused on top-header GSTIN and drug license (full bill + header crop)."""
+    """Single pass for top-header GSTIN and drug license (no retry — saves ~15–30s)."""
+    raw = document_raw or (doc.raw if doc else b"")
     inv_model = (os.getenv("OPENAI_INVOICE_MODEL") or model).strip()
-    refine_blocks = _regulatory_vision_blocks(image_blocks, document_raw)
-    has_crop = document_raw and build_header_crop_data_url(document_raw)
+    refine_blocks = build_regulatory_header_blocks(image_blocks, raw, doc=doc)
+    has_crop = bool(build_header_crop_from_document(raw, doc=doc))
     user_text = (
         "Extract gst_number (15-char GSTIN, no label) and drug_license_number "
         "(every DL NO. line, joined with '; ') from the bill header."
@@ -1796,7 +1801,7 @@ def _refine_pharmacy_regulatory(
         refine_blocks,
         "pharmacy_regulatory_extraction",
         PHARMACY_REGULATORY_SCHEMA,
-        500,
+        350,
     )
     inv_raw = data.get("invoice_parameters")
     inv: Dict[str, Any] = dict(inv_raw) if isinstance(inv_raw, dict) else {}
@@ -1804,28 +1809,8 @@ def _refine_pharmacy_regulatory(
     _normalize_pharmacy_regulatory_ids(inv)
     data["invoice_parameters"] = inv
 
-    if _pharmacy_regulatory_invalid(inv):
-        refined_retry = _call_openai_json(
-            client,
-            inv_model,
-            PHARMACY_REGULATORY_PROMPT,
-            (
-                "gst_number or drug_license_number may still be missing. "
-                "Re-read the top-left and top margin (GST NO., GSTIN, DL NO. lines). "
-                "Return both fields."
-            )
-            + (" Use the zoomed header image if provided." if has_crop else ""),
-            refine_blocks,
-            "pharmacy_regulatory_extraction_retry",
-            PHARMACY_REGULATORY_SCHEMA,
-            500,
-        )
-        _apply_regulatory_from_refined(inv, refined_retry)
-        _normalize_pharmacy_regulatory_ids(inv)
-        data["invoice_parameters"] = inv
-
-    if document_raw and not _extract_gstin(_str_val(inv.get("gst_number"))):
-        _refine_pharmacy_gst_header(client, model, document_raw, data)
+    if raw and not _extract_gstin(_str_val(inv.get("gst_number"))):
+        _refine_pharmacy_gst_header(client, model, raw, data, doc=doc)
 
 
 def _refine_lab_report(
@@ -1833,14 +1818,19 @@ def _refine_lab_report(
     model: str,
     image_blocks: List[Dict[str, Any]],
     data: Dict[str, Any],
+    document_raw: bytes | None = None,
+    doc: DocumentPages | None = None,
 ) -> None:
     report_model = (os.getenv("OPENAI_REPORT_MODEL") or model).strip()
+    refine_blocks = build_refine_image_blocks(
+        image_blocks, document_raw or (doc.raw if doc else b""), detail="high", doc=doc
+    )
     refined = _call_openai_json(
         client,
         report_model,
         LAB_REPORT_PROMPT,
         "Classify printed vs handwritten content and extract lab test fields.",
-        image_blocks,
+        refine_blocks,
         "lab_report_extraction",
         LAB_REPORT_SCHEMA,
         2000,
@@ -1852,33 +1842,44 @@ def classify_document_url_openai(url: str) -> Dict[str, Any]:
     """Classify one image URL and return category-specific extracted parameters."""
     model = (os.getenv("OPENAI_MODEL") or DEFAULT_MODEL).strip()
     client = get_openai_client()
-    image_blocks, document_raw = build_vision_image_blocks(url)
+    doc = load_document(url)
+    image_blocks = build_vision_blocks_from_document(doc)
     data = _call_openai_vision(client, model, image_blocks)
     _recover_medical_classification(data)
 
     if _peek_invoice_needs_refine(data):
         try:
             _pause_between_openai_calls()
-            _refine_diagnostic_invoice(client, model, image_blocks, data)
+            _refine_diagnostic_invoice(client, model, image_blocks, data, doc.raw, doc)
         except Exception:
             logger.exception("Invoice refine pass failed for %s", url)
 
     if _peek_pharmacy_regulatory_needs_refine(data):
         try:
             _pause_between_openai_calls()
-            _refine_pharmacy_regulatory(client, model, image_blocks, data, document_raw)
+            inv_raw = data.get("invoice_parameters")
+            inv = dict(inv_raw) if isinstance(inv_raw, dict) else {}
+            _normalize_invoice_fields(inv)
+            if _pharmacy_gst_only_missing(inv):
+                _refine_pharmacy_gst_header(client, model, doc.raw, data, doc)
+            else:
+                _refine_pharmacy_regulatory(
+                    client, model, image_blocks, data, doc.raw, doc
+                )
         except Exception:
             logger.exception("Pharmacy regulatory refine pass failed for %s", url)
     elif _peek_prescription_category(data) == "prescription":
         try:
             _pause_between_openai_calls()
-            _refine_prescription_medicines(client, model, image_blocks, data)
+            _refine_prescription_medicines(
+                client, model, image_blocks, data, doc.raw, doc
+            )
         except Exception:
             logger.exception("Prescription medicine refine pass failed for %s", url)
     elif _peek_report_needs_refine(data):
         try:
             _pause_between_openai_calls()
-            _refine_lab_report(client, model, image_blocks, data)
+            _refine_lab_report(client, model, image_blocks, data, doc.raw, doc)
         except Exception:
             logger.exception("Lab report refine pass failed for %s", url)
     return _build_public_response(url, data)
