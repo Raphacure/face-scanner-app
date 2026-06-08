@@ -289,26 +289,73 @@ def _header_crop_top_ratio() -> float:
     return max(0.15, min(0.55, ratio))
 
 
+def _header_crop_upscale_factor() -> float:
+    try:
+        factor = float(os.getenv("PHARMACY_HEADER_CROP_UPSCALE", "2.0"))
+    except ValueError:
+        factor = 2.0
+    return max(1.0, min(3.0, factor))
+
+
+def _encode_crop_jpeg(img: Any) -> str | None:
+    import cv2
+
+    ok, encoded = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    if not ok:
+        return None
+    return _data_url_from_bytes(encoded.tobytes(), "image/jpeg")
+
+
+def _upscale_crop(img: Any, factor: float) -> Any:
+    import cv2
+
+    if factor <= 1.0:
+        return img
+    height, width = img.shape[:2]
+    return cv2.resize(
+        img,
+        (max(1, int(width * factor)), max(1, int(height * factor))),
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+
 def build_header_crop_data_url(image_bytes: bytes) -> str | None:
     """Crop top band of a bill image — GST/DL are often printed in this margin."""
+    crops = build_gst_header_crop_urls(image_bytes)
+    return crops[0] if crops else None
+
+
+def build_gst_header_crop_urls(image_bytes: bytes) -> List[str]:
+    """Upscaled top band + top-right corner crops for small GSTIN / licence text."""
     try:
         import cv2
         import numpy as np
     except ImportError:
-        return None
+        return []
 
     arr = np.frombuffer(image_bytes, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
-        return None
+        return []
 
-    height = img.shape[0]
-    crop_height = max(1, int(height * _header_crop_top_ratio()))
-    top_band = img[0:crop_height, :]
-    ok, encoded = cv2.imencode(".jpg", top_band, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-    if not ok:
-        return None
-    return _data_url_from_bytes(encoded.tobytes(), "image/jpeg")
+    height, width = img.shape[:2]
+    top_ratio = _header_crop_top_ratio()
+    crop_height = max(1, int(height * top_ratio))
+    upscale = _header_crop_upscale_factor()
+    urls: List[str] = []
+
+    top_band = _upscale_crop(img[0:crop_height, :], upscale)
+    top_url = _encode_crop_jpeg(top_band)
+    if top_url:
+        urls.append(top_url)
+
+    right_start = max(0, int(width * 0.42))
+    top_right = _upscale_crop(img[0:crop_height, right_start:width], upscale)
+    top_right_url = _encode_crop_jpeg(top_right)
+    if top_right_url and top_right_url != top_url:
+        urls.append(top_right_url)
+
+    return urls
 
 
 def build_header_crop_from_document(
@@ -351,15 +398,42 @@ def build_regulatory_header_blocks(
                 }
             )
 
-    crop_url = build_header_crop_from_document(document_raw, doc=doc)
-    if crop_url:
-        blocks.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": crop_url, "detail": "high"},
-            }
-        )
+    page_bytes = _document_page_bytes(document_raw, doc)
+    if page_bytes:
+        for crop_url in build_gst_header_crop_urls(page_bytes):
+            blocks.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": crop_url, "detail": "high"},
+                }
+            )
     return blocks
+
+
+def _document_page_bytes(document_raw: bytes, doc: DocumentPages | None = None) -> bytes | None:
+    if doc is not None and doc.page_images:
+        return doc.page_images[0]
+    if is_pdf_bytes(document_raw):
+        pages = render_pdf_page_images(document_raw, 1)
+        return pages[0] if pages else None
+    return document_raw or None
+
+
+def build_gst_header_blocks_from_document(
+    document_raw: bytes,
+    doc: DocumentPages | None = None,
+) -> List[Dict[str, Any]]:
+    """Vision blocks with upscaled header crops only — for dedicated GSTIN extraction."""
+    page_bytes = _document_page_bytes(document_raw, doc)
+    if not page_bytes:
+        return []
+    return [
+        {
+            "type": "image_url",
+            "image_url": {"url": crop_url, "detail": "high"},
+        }
+        for crop_url in build_gst_header_crop_urls(page_bytes)
+    ]
 
 
 def build_refine_image_blocks(
