@@ -13,7 +13,7 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 
 
 class ReceiptPrescriptionClassifyRequest(BaseModel):
-    """Public image URLs of medical documents (JPEG/PNG/WebP or PDF) to classify via OpenAI Vision."""
+    """Public image/PDF URLs to classify (Textract OCR + OpenAI Vision hybrid)."""
 
     urls: List[str] = Field(
         ...,
@@ -25,9 +25,5 @@ class ReceiptPrescriptionClassifyRequest(BaseModel):
 
 @router.post("/classify-receipt")
 def classify_receipt_prescription(payload: ReceiptPrescriptionClassifyRequest):
-    """
-    For each image URL: document_category (prescription/invoice/report/other),
-    extracted parameters, or rejection when the image is not a medical document.
-    Requires OPENAI_API_KEY.
-    """
+    """Hybrid classify: Textract (printed fields) + OpenAI Vision (category/medical fields)."""
     return classify_receipt_prescription_urls_controller(payload.urls)

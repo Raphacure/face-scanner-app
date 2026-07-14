@@ -13,9 +13,9 @@ _INTER_URL_DELAY_MS = max(0, int(os.getenv("OPENAI_INTER_URL_DELAY_MS", "0")))
 
 def _classify_parallel_workers(url_count: int) -> int:
     try:
-        workers = int(os.getenv("OPENAI_CLASSIFY_MAX_PARALLEL", "2"))
+        workers = int(os.getenv("OPENAI_CLASSIFY_MAX_PARALLEL", "4"))
     except ValueError:
-        workers = 2
+        workers = 4
     return max(1, min(workers, url_count, MAX_URLS))
 
 
@@ -54,11 +54,12 @@ def classify_receipt_prescription_urls_controller(urls: List[str]) -> Dict[str, 
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [
-                pool.submit(_classify_one, index, url) for index, url in enumerate(urls)
+                pool.submit(_classify_one, index, url)
+                for index, url in enumerate(urls)
             ]
             for future in as_completed(futures):
                 indexed_results.append(future.result())
 
     indexed_results.sort(key=lambda item: item[0])
     results = [item[1] for item in indexed_results]
-    return {"status": "success", "results": results}
+    return {"status": "success", "mode": "hybrid", "results": results}
