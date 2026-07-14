@@ -326,7 +326,7 @@ def build_header_crop_data_url(image_bytes: bytes) -> str | None:
 
 
 def build_gst_header_crop_urls(image_bytes: bytes) -> List[str]:
-    """Upscaled top band + top-right corner crops for small GSTIN / licence text."""
+    """Upscaled top / top-right crops for small GSTIN text (incl. dot-matrix bills)."""
     try:
         import cv2
         import numpy as np
@@ -341,21 +341,44 @@ def build_gst_header_crop_urls(image_bytes: bytes) -> List[str]:
     height, width = img.shape[:2]
     top_ratio = _header_crop_top_ratio()
     crop_height = max(1, int(height * top_ratio))
-    upscale = _header_crop_upscale_factor()
+    upscale = max(_header_crop_upscale_factor(), 2.5)
     urls: List[str] = []
+    seen: set[str] = set()
 
-    top_band = _upscale_crop(img[0:crop_height, :], upscale)
-    top_url = _encode_crop_jpeg(top_band)
-    if top_url:
-        urls.append(top_url)
+    def _add(crop_img: Any) -> None:
+        enhanced = _enhance_for_small_text(crop_img)
+        url = _encode_crop_jpeg(enhanced)
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
 
-    right_start = max(0, int(width * 0.42))
-    top_right = _upscale_crop(img[0:crop_height, right_start:width], upscale)
-    top_right_url = _encode_crop_jpeg(top_right)
-    if top_right_url and top_right_url != top_url:
-        urls.append(top_right_url)
+    # Full top band
+    _add(_upscale_crop(img[0:crop_height, :], upscale))
+    # Top-right (GSTIN often top-right on pharmacy bills)
+    right_start = max(0, int(width * 0.40))
+    _add(_upscale_crop(img[0:crop_height, right_start:width], upscale))
+    # Tighter top strip + top-right corner for tiny header GSTIN
+    tight_h = max(1, int(height * 0.22))
+    _add(_upscale_crop(img[0:tight_h, :], upscale))
+    corner_left = max(0, int(width * 0.48))
+    _add(_upscale_crop(img[0:tight_h, corner_left:width], max(upscale, 3.0)))
 
     return urls
+
+
+def _enhance_for_small_text(img: Any) -> Any:
+    """Contrast boost helps Vision/OCR on faded dot-matrix print."""
+    import cv2
+
+    if img is None or img.size == 0:
+        return img
+    try:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        boosted = clahe.apply(gray)
+        return cv2.cvtColor(boosted, cv2.COLOR_GRAY2BGR)
+    except Exception:
+        return img
 
 
 def build_header_crop_from_document(
@@ -433,6 +456,58 @@ def build_gst_header_blocks_from_document(
             "image_url": {"url": crop_url, "detail": "high"},
         }
         for crop_url in build_gst_header_crop_urls(page_bytes)
+    ]
+
+
+def build_stamp_crop_urls(image_bytes: bytes) -> List[str]:
+    """Bottom / bottom-right crops where doctor stamp + CN No usually appear."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return []
+
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return []
+
+    height, width = img.shape[:2]
+    upscale = max(_header_crop_upscale_factor(), 2.5)
+    urls: List[str] = []
+    seen: set[str] = set()
+
+    def _add(crop_img: Any) -> None:
+        enhanced = _enhance_for_small_text(crop_img)
+        url = _encode_crop_jpeg(enhanced)
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+
+    bottom_start = max(0, int(height * 0.55))
+    _add(_upscale_crop(img[bottom_start:height, :], upscale))
+    right_start = max(0, int(width * 0.40))
+    _add(_upscale_crop(img[bottom_start:height, right_start:width], upscale))
+    # Lower strip only (rubber stamp band)
+    strip_start = max(0, int(height * 0.68))
+    _add(_upscale_crop(img[strip_start:height, :], max(upscale, 3.0)))
+    return urls
+
+
+def build_stamp_blocks_from_document(
+    document_raw: bytes,
+    doc: DocumentPages | None = None,
+) -> List[Dict[str, Any]]:
+    """Vision blocks focused on doctor stamp / signature zone."""
+    page_bytes = _document_page_bytes(document_raw, doc)
+    if not page_bytes:
+        return []
+    return [
+        {
+            "type": "image_url",
+            "image_url": {"url": crop_url, "detail": "high"},
+        }
+        for crop_url in build_stamp_crop_urls(page_bytes)
     ]
 
 
