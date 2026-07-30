@@ -25,5 +25,5 @@ class ReceiptPrescriptionClassifyRequest(BaseModel):
 
 @router.post("/classify-receipt")
 def classify_receipt_prescription(payload: ReceiptPrescriptionClassifyRequest):
-    """Hybrid classify: Textract (printed fields) + OpenAI Vision (category/medical fields)."""
+    """Hybrid classify: Textract + OpenAI Vision for Rx / invoice / report / payment_receipt."""
     return classify_receipt_prescription_urls_controller(payload.urls)

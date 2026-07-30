@@ -1,6 +1,6 @@
 """
-Classify medical document images and extract structured parameters
-for prescription (Rx), invoice, and diagnostic report.
+Classify medical / claim document images and extract structured parameters
+for prescription (Rx), invoice, diagnostic report, and payment receipt.
 """
 
 from __future__ import annotations
@@ -129,6 +129,25 @@ REPORT_PARAM_KEYS: Tuple[str, ...] = (
     "authorized_stamp",
 )
 
+# Payment proof / UPI / bank transfer / card confirmation screenshots.
+PAYMENT_RECEIPT_PARAM_KEYS: Tuple[str, ...] = (
+    "payment_mode",
+    "payment_amount",
+    "transaction_date",
+    "transaction_id",
+    "reference_number",
+    "utr",
+    "payer_name",
+    "payee_name",
+    "upi_id",
+    "bank_name",
+    "payment_status",
+    "payment_time",
+    "account_number_masked",
+    "ifsc",
+    "remarks",
+)
+
 # Shared required fields for most prescription subtypes.
 PRESCRIPTION_REQUIRED: Tuple[str, ...] = (
     "patient_name",
@@ -173,9 +192,16 @@ REPORT_REQUIRED: Tuple[str, ...] = (
     "pathologist_registration_number",
 )
 
+PAYMENT_RECEIPT_REQUIRED: Tuple[str, ...] = (
+    "payment_amount",
+    "transaction_date",
+    "payment_status",
+    "payment_mode",
+)
+
 
 def _unique_param_keys(*groups: Sequence[str]) -> Tuple[str, ...]:
-    """Stable union of param keys across prescription / invoice / report."""
+    """Stable union of param keys across prescription / invoice / report / payment."""
     seen: set[str] = set()
     ordered: List[str] = []
     for group in groups:
@@ -191,6 +217,7 @@ ALL_CLAIM_PARAM_KEYS: Tuple[str, ...] = _unique_param_keys(
     PRESCRIPTION_PARAM_KEYS,
     INVOICE_PARAM_KEYS,
     REPORT_PARAM_KEYS,
+    PAYMENT_RECEIPT_PARAM_KEYS,
 )
 
 _INVOICE_ARRAY_KEYS = frozenset(
@@ -239,7 +266,7 @@ def _to_all_claim_parameters(partial: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _merge_claim_field_buckets(*buckets: Dict[str, Any]) -> Dict[str, Any]:
-    """Union non-empty fields across Rx / invoice / report buckets (first wins)."""
+    """Union non-empty fields across Rx / invoice / report / payment buckets (first wins)."""
     merged: Dict[str, Any] = {}
     for bucket in buckets:
         if not isinstance(bucket, dict):
@@ -435,26 +462,38 @@ def _prescription_params_schema() -> Dict[str, Any]:
 PRESCRIPTION_PARAMS_SCHEMA = _prescription_params_schema()
 INVOICE_PARAMS_SCHEMA = _param_object_schema(INVOICE_PARAM_KEYS, _INVOICE_ARRAY_KEYS)
 REPORT_PARAMS_SCHEMA = _param_object_schema(REPORT_PARAM_KEYS, _REPORT_ARRAY_KEYS)
+PAYMENT_RECEIPT_PARAMS_SCHEMA = _param_object_schema(
+    PAYMENT_RECEIPT_PARAM_KEYS, frozenset()
+)
 
 SYSTEM_PROMPT = """Indian medical claims OCR. Fill JSON; use "" / [] if absent. Signatures/stamps: "present" if visible but illegible.
 
 EXTRACTION RULE (critical): Map EVERY visible value into the matching parameter fields.
-Fill prescription_parameters AND invoice_parameters AND report_parameters whenever those fields appear on the page —
-irrespective of document_category. Category is only a best-guess label for downstream validation; do NOT
-leave fields empty just because they "belong to another document type".
+Fill prescription_parameters AND invoice_parameters AND report_parameters AND payment_receipt_parameters
+whenever those fields appear on the page — irrespective of document_category. Category is only a
+best-guess label for downstream validation; do NOT leave fields empty just because they "belong to
+another document type".
 Examples: OPD/Rx page with footer GST → still fill invoice_parameters.gst_number.
 Pharmacy bill with patient age → still fill invoice_parameters.patient_age (and prescription patient_* if present).
 Lab report with doctor name → fill report + any overlapping patient_* fields.
+UPI/GPay/PhonePe payment screenshot → fill payment_receipt_parameters (never invent values).
 
 CONTENT TYPE (filled data only; ignore blank form lines). percents must sum to 100.
 - handwritten: mostly hand-filled (cash memo) → hw%~100
 - computer_generated: typed/printed → cg%~90-100; ignore footer signature alone
 - Printed pharmacy/tax invoice/POS = computer_generated. Printed lab report = computer_generated.
+- Payment app screenshots / bank confirmations = computer_generated.
 
 CATEGORY (label only — still extract all visible fields into all buckets above)
-- prescription | invoice | report | other
-- other = only screenshots/selfies/blank/unreadable — NEVER pharmacy, clinic, or hospital bills
+- prescription | invoice | report | payment_receipt | other
+- payment_receipt = UPI screenshots (GPay/PhonePe/Paytm/BHIM/Amazon Pay), bank transfer
+  (NEFT/IMPS/RTGS/UTR), card payment confirmations, payment success/failure pages, SMS-style
+  payment confirmations, readable cash receipts that are ONLY payment proof (not a medical bill).
+- NEVER classify a payment screenshot as invoice. Medical bills/cash memos with line items = invoice.
+- other = selfies/blank/unreadable/random non-claim images — NEVER pharmacy, clinic, hospital bills,
+  or payment proofs
 - is_medical_document=true for Rx, bills, lab reports, OPD receipts
+- is_medical_document=false for pure payment_receipt / unrelated images
 - Rx with no ₹ total → prescription (never invoice). Upside-down photos still medical.
 - OPD SUMMARY / eye exam / refraction / glasses power sheets → prescription (eye_care), NOT report.
 - report = lab/pathology/diagnostic test result sheets only (pathologist, specimen, analytes).
@@ -463,6 +502,7 @@ invoice_subtype: pharmacy | diagnostic | opd_consultation | dental | eye_care | 
 - pharmacy/chemist Bill of Supply/tax invoice/cash memo → pharmacy
 - diagnostic centre bill → diagnostic; clinic "Received with thanks"/OPD fee → opd_consultation
 - dental clinic → dental; optical/lens/frame → eye_care
+- When document_category=payment_receipt → invoice_subtype=not_applicable, prescription_subtype=not_applicable
 
 INVOICE: patient_*, invoice_number/date, provider_*, doctor_name, total_amount (digits only, primary total),
 payment_mode, transaction_reference, authorized_stamp/signature.
@@ -472,6 +512,16 @@ Pharmacy: drug_license_number (all DL lines, join "; "); medicine_details[] "nam
 OPD: consultation_charges, registration_charges, service_details[].
 Diagnostic: sample_collection_date, test_details[] "Test — Rs amt".
 Dental/eye: item_details[] procedures or frame/lens lines.
+
+PAYMENT_RECEIPT (mandatory when visible — do not invent):
+- payment_mode: upi | bank_transfer | card | cash | wallet
+- payment_amount: digits only (e.g. "684.00") — the paid amount, not balance
+- transaction_date: ISO-like YYYY-MM-DD when possible, else as printed
+- transaction_id: primary txn / UTR / UPI ref / bank ref
+- payment_status: success | completed | failed | pending (normalize synonyms; "Payment Successful"→success)
+Strongly recommended: payee_name, payer_name, upi_id (VPA like name@bank), bank_name,
+reference_number (secondary ref), utr (duplicate transaction_id when UTR is the primary id).
+Optional: payment_time, account_number_masked, ifsc, remarks.
 
 prescription_subtype: opd | pharmacy | diagnostic | dental | eye_care | uncertain | not_applicable
 Common: patient_*, consultation_date, clinic_hospital_*, doctor_name/qualification/registration_number,
@@ -558,7 +608,7 @@ DOCUMENT_SCHEMA: Dict[str, Any] = {
         "non_medical_reason": {"type": "string"},
         "document_category": {
             "type": "string",
-            "enum": ["prescription", "invoice", "report", "other"],
+            "enum": ["prescription", "invoice", "report", "payment_receipt", "other"],
         },
         "invoice_subtype": {
             "type": "string",
@@ -587,6 +637,7 @@ DOCUMENT_SCHEMA: Dict[str, Any] = {
         "prescription_parameters": PRESCRIPTION_PARAMS_SCHEMA,
         "invoice_parameters": INVOICE_PARAMS_SCHEMA,
         "report_parameters": REPORT_PARAMS_SCHEMA,
+        "payment_receipt_parameters": PAYMENT_RECEIPT_PARAMS_SCHEMA,
     },
     "required": [
         "document_type",
@@ -600,11 +651,21 @@ DOCUMENT_SCHEMA: Dict[str, Any] = {
         "prescription_parameters",
         "invoice_parameters",
         "report_parameters",
+        "payment_receipt_parameters",
     ],
     "additionalProperties": False,
 }
 
-_VALID_CATEGORIES = frozenset({"prescription", "invoice", "report", "other"})
+_VALID_CATEGORIES = frozenset(
+    {"prescription", "invoice", "report", "payment_receipt", "other"}
+)
+
+_VALID_PAYMENT_MODES = frozenset(
+    {"upi", "bank_transfer", "card", "cash", "wallet"}
+)
+_VALID_PAYMENT_STATUSES = frozenset(
+    {"success", "completed", "failed", "pending"}
+)
 
 
 def _str_val(raw: Any) -> str:
@@ -1230,6 +1291,301 @@ def _invoice_subtype_extra_checks(
     return checks
 
 
+_PAYMENT_STATUS_ALIASES = {
+    "successful": "success",
+    "successfully": "success",
+    "paid": "success",
+    "done": "success",
+    "complete": "completed",
+    "payment successful": "success",
+    "payment completed": "completed",
+    "transaction successful": "success",
+    "transaction failed": "failed",
+    "payment failed": "failed",
+    "failure": "failed",
+    "declined": "failed",
+    "processing": "pending",
+    "in progress": "pending",
+    "awaiting": "pending",
+}
+
+_PAYMENT_MODE_ALIASES = {
+    "gpay": "upi",
+    "google pay": "upi",
+    "phonepe": "upi",
+    "paytm upi": "upi",
+    "bhim": "upi",
+    "amazon pay": "upi",
+    "amazon pay upi": "upi",
+    "upi payment": "upi",
+    "neft": "bank_transfer",
+    "imps": "bank_transfer",
+    "rtgs": "bank_transfer",
+    "rtps": "bank_transfer",
+    "bank transfer": "bank_transfer",
+    "net banking": "bank_transfer",
+    "netbanking": "bank_transfer",
+    "credit card": "card",
+    "debit card": "card",
+    "credit": "card",
+    "debit": "card",
+    "visa": "card",
+    "mastercard": "card",
+    "rupay": "card",
+    "paytm wallet": "wallet",
+    "wallet": "wallet",
+}
+
+
+_KNOWN_UPI_HANDLES = frozenset(
+    {
+        "upi",
+        "ybl",
+        "ibl",
+        "axl",
+        "apl",
+        "paytm",
+        "okhdfcbank",
+        "oksbi",
+        "okicici",
+        "okaxis",
+        "okbizaxis",
+        "waaxis",
+        "wahdfcbank",
+        "ptyes",
+        "ptaxis",
+        "yesbank",
+        "freecharge",
+        "amazonpay",
+        "ikwik",
+        "jupiteraxis",
+        "indus",
+        "kbl",
+        "barodampay",
+        "uboi",
+        "cbin",
+        "idbi",
+    }
+)
+
+
+def _is_plausible_upi_id(value: Any) -> bool:
+    """Accept real UPI VPAs; reject emails / letterhead addresses (info@hospital)."""
+    raw = _str_val(value)
+    if "@" not in raw or " " in raw:
+        return False
+    local, _, handle = raw.partition("@")
+    if not local or not handle:
+        return False
+    handle_l = handle.lower()
+    local_l = local.lower()
+    if "." in handle_l:
+        return False
+    if local_l in {"info", "admin", "support", "contact", "hello", "mail", "email"}:
+        return False
+    if handle_l in _KNOWN_UPI_HANDLES:
+        return True
+    if re.match(r"^(ok|pt|yb|ibl|axl|apl|wa)", handle_l):
+        return True
+    if len(handle_l) <= 12 and any(ch.isdigit() for ch in local):
+        return True
+    return False
+
+
+def _normalize_payment_amount(raw: Any) -> str:
+    text = _str_val(raw)
+    if not text:
+        return ""
+    clean = re.sub(r"[^\d.]", "", text.replace(",", ""))
+    if not clean:
+        return ""
+    if clean.count(".") > 1:
+        parts = clean.split(".")
+        clean = "".join(parts[:-1]) + "." + parts[-1]
+    try:
+        if float(clean) <= 0:
+            return ""
+    except ValueError:
+        return ""
+    return clean
+
+
+def _normalize_payment_status(raw: Any) -> str:
+    text = _str_val(raw).lower()
+    if not text:
+        return ""
+    if text in _VALID_PAYMENT_STATUSES:
+        return text
+    aliased = _PAYMENT_STATUS_ALIASES.get(text)
+    if aliased:
+        return aliased
+    for key, status in _PAYMENT_STATUS_ALIASES.items():
+        if key in text:
+            return status
+    for status in _VALID_PAYMENT_STATUSES:
+        if status in text:
+            return status
+    return text
+
+
+def _normalize_payment_mode(raw: Any) -> str:
+    text = _str_val(raw).lower()
+    if not text:
+        return ""
+    if text in _VALID_PAYMENT_MODES:
+        return text
+    aliased = _PAYMENT_MODE_ALIASES.get(text)
+    if aliased:
+        return aliased
+    for key, mode in sorted(_PAYMENT_MODE_ALIASES.items(), key=lambda kv: -len(kv[0])):
+        if key in text:
+            return mode
+    for mode in _VALID_PAYMENT_MODES:
+        if mode in text:
+            return mode
+    return text
+
+
+def _normalize_bank_name(raw: Any) -> str:
+    text = _str_val(raw)
+    if not text:
+        return ""
+    # Bare "Axis" is usually an auto-refraction column, not Axis Bank.
+    low = text.lower().strip()
+    if low in {"axis", "yes", "union", "federal"}:
+        return ""
+    return text
+
+
+def _normalize_payment_receipt_fields(params: Dict[str, Any]) -> None:
+    """Normalize payment proof fields; clear placeholders; sync utr/transaction_id."""
+    for key in PAYMENT_RECEIPT_PARAM_KEYS:
+        val = _str_val(params.get(key))
+        if val.lower() in _PLACEHOLDER_VALUES:
+            params[key] = ""
+        else:
+            params[key] = val
+
+    params["payment_amount"] = _normalize_payment_amount(params.get("payment_amount"))
+    params["payment_status"] = _normalize_payment_status(params.get("payment_status"))
+    params["payment_mode"] = _normalize_payment_mode(params.get("payment_mode"))
+    params["bank_name"] = _normalize_bank_name(params.get("bank_name"))
+
+    upi = _str_val(params.get("upi_id"))
+    params["upi_id"] = upi if _is_plausible_upi_id(upi) else ""
+
+    payee = _str_val(params.get("payee_name"))
+    if len(payee) < 3 or payee.lower() in {"none", "nil", "n/a", "ry none", "tal"}:
+        params["payee_name"] = ""
+    elif re.match(r"^(ry|tal|history)\b", payee, re.I):
+        params["payee_name"] = ""
+
+    txn = _str_val(params.get("transaction_id"))
+    utr = _str_val(params.get("utr"))
+    ref = _str_val(params.get("reference_number"))
+    if not txn and utr:
+        params["transaction_id"] = utr
+        txn = utr
+    if not utr and txn and re.search(r"utr|^\d{12,}$", txn, re.IGNORECASE):
+        params["utr"] = txn
+        utr = txn
+    if not ref and txn:
+        params["reference_number"] = txn
+
+
+def _payment_amount_present(pay: Dict[str, Any]) -> bool:
+    amount = _normalize_payment_amount(pay.get("payment_amount"))
+    return bool(amount)
+
+
+def _payment_txn_id_present(pay: Dict[str, Any]) -> bool:
+    return (
+        _is_filled(pay, "transaction_id")
+        or _is_filled(pay, "reference_number")
+        or _is_filled(pay, "utr")
+    )
+
+
+def _payment_receipt_extra_checks(
+    pay: Dict[str, Any],
+) -> List[Tuple[str, bool]]:
+    return [("transaction_id_or_reference_or_utr", _payment_txn_id_present(pay))]
+
+
+def _looks_like_payment_receipt(pay: Dict[str, Any]) -> bool:
+    """Strong payment-proof signals only — ignore email/Axis/IOP false positives."""
+    if not isinstance(pay, dict):
+        return False
+    amount = _payment_amount_present(pay)
+    status = _is_filled(pay, "payment_status")
+    txn = _payment_txn_id_present(pay)
+    mode = _is_filled(pay, "payment_mode")
+    upi = _is_plausible_upi_id(pay.get("upi_id"))
+
+    # Need a real payment outcome or transfer rail, plus amount or txn id.
+    if status and (amount or txn) and (mode or upi or txn):
+        return True
+    if amount and txn and (status or mode):
+        return True
+    if upi and amount and (status or txn or mode):
+        return True
+    if status and txn and mode:
+        return True
+    return False
+
+
+def _payment_extraction_score(pay: Dict[str, Any]) -> int:
+    score = 0
+    weighted = (
+        ("payment_amount", 2),
+        ("transaction_date", 1),
+        ("transaction_id", 2),
+        ("utr", 2),
+        ("reference_number", 1),
+        ("payment_status", 2),
+        ("payment_mode", 1),
+        ("upi_id", 2),
+        ("payee_name", 1),
+        ("payer_name", 1),
+        ("bank_name", 1),
+    )
+    for key, weight in weighted:
+        if key == "payment_amount":
+            if _payment_amount_present(pay):
+                score += weight
+        elif key == "upi_id":
+            if _is_plausible_upi_id(pay.get("upi_id")):
+                score += weight
+        elif key == "bank_name":
+            if _normalize_bank_name(pay.get("bank_name")):
+                score += weight
+        elif _is_filled(pay, key):
+            score += weight
+    return score
+
+
+def _non_medical_reason_suggests_payment(data: Dict[str, Any]) -> bool:
+    reason = _str_val(data.get("non_medical_reason")).lower()
+    if not reason:
+        return False
+    return any(
+        hint in reason
+        for hint in (
+            "payment",
+            "upi",
+            "gpay",
+            "phonepe",
+            "paytm",
+            "neft",
+            "imps",
+            "utr",
+            "transaction",
+            "wallet",
+            "bank transfer",
+        )
+    )
+
+
 def _prescription_blob(params: Dict[str, Any]) -> str:
     parts = [
         _str_val(params.get("clinic_hospital_name")),
@@ -1596,8 +1952,81 @@ def _looks_like_invoice_bill(inv: Dict[str, Any]) -> bool:
     )
 
 
+def _has_real_invoice_structure(inv: Dict[str, Any]) -> bool:
+    """Medical/pharmacy bill structure — not a UPI screenshot with only an amount."""
+    return bool(
+        _is_filled(inv, "medicine_details")
+        or _is_filled(inv, "test_details")
+        or _is_filled(inv, "item_details")
+        or _is_filled(inv, "service_details")
+        or (
+            _is_filled(inv, "invoice_number")
+            and (
+                _is_filled(inv, "provider_name")
+                or _is_filled(inv, "gst_number")
+                or _is_filled(inv, "drug_license_number")
+            )
+        )
+        or (
+            _is_filled(inv, "provider_name")
+            and _is_filled(inv, "total_amount")
+            and (
+                _is_filled(inv, "gst_number")
+                or _is_filled(inv, "invoice_number")
+                or _is_filled(inv, "consultation_charges")
+            )
+        )
+    )
+
+
+def _seed_payment_from_invoice_leak(
+    pay: Dict[str, Any], inv: Dict[str, Any]
+) -> None:
+    """Copy UPI amount / txn ref leaked into invoice_* into payment_receipt_*."""
+    if not _payment_amount_present(pay) and _is_filled(inv, "total_amount"):
+        pay["payment_amount"] = _normalize_payment_amount(inv.get("total_amount"))
+    if not _is_filled(pay, "payment_mode") and _is_filled(inv, "payment_mode"):
+        pay["payment_mode"] = _normalize_payment_mode(inv.get("payment_mode"))
+    if not _payment_txn_id_present(pay) and _is_filled(inv, "transaction_reference"):
+        ref = _str_val(inv.get("transaction_reference"))
+        pay["transaction_id"] = ref
+        if not _str_val(pay.get("reference_number")):
+            pay["reference_number"] = ref
+    if not _is_filled(pay, "transaction_date") and _is_filled(inv, "invoice_date"):
+        pay["transaction_date"] = _str_val(inv.get("invoice_date"))
+    if not _is_filled(pay, "payer_name") and _is_filled(inv, "patient_name"):
+        # Only when other payment rails already present (avoid Rx patient → payer).
+        if (
+            _payment_txn_id_present(pay)
+            or _is_plausible_upi_id(pay.get("upi_id"))
+            or _is_filled(pay, "payment_status")
+        ):
+            pay["payer_name"] = _str_val(inv.get("patient_name"))
+    _normalize_payment_receipt_fields(pay)
+
+
+def _is_payment_proof_not_medical_bill(
+    pay: Dict[str, Any], inv: Dict[str, Any]
+) -> bool:
+    """UPI/bank payment screenshot mistaken for invoice (amount → total_amount)."""
+    if not _looks_like_payment_receipt(pay):
+        return False
+    if _has_real_invoice_structure(inv):
+        return False
+    return True
+
+
+def _apply_payment_receipt_category(data: Dict[str, Any], pay: Dict[str, Any]) -> None:
+    data["is_medical_document"] = False
+    data["document_category"] = "payment_receipt"
+    data["invoice_subtype"] = "not_applicable"
+    data["prescription_subtype"] = "not_applicable"
+    data["non_medical_reason"] = ""
+    data["payment_receipt_parameters"] = pay
+
+
 def _recover_medical_classification(data: Dict[str, Any]) -> None:
-    """Undo false 'other' when extraction or reason indicates a real bill/Rx/report."""
+    """Undo false 'other' when extraction or reason indicates a real bill/Rx/report/payment."""
     inv = _normalize_params(
         data.get("invoice_parameters"), INVOICE_PARAM_KEYS, _INVOICE_ARRAY_KEYS
     )
@@ -1609,18 +2038,36 @@ def _recover_medical_classification(data: Dict[str, Any]) -> None:
     rep = _normalize_params(
         data.get("report_parameters"), REPORT_PARAM_KEYS, _REPORT_ARRAY_KEYS
     )
+    pay = _normalize_params(
+        data.get("payment_receipt_parameters"), PAYMENT_RECEIPT_PARAM_KEYS, frozenset()
+    )
+    _normalize_payment_receipt_fields(pay)
+    _seed_payment_from_invoice_leak(pay, inv)
 
     inv_score = _invoice_extraction_score(inv)
     rx_score = _count_extracted_fields(rx)
     rep_score = _count_extracted_fields(rep)
+    pay_score = _payment_extraction_score(pay)
     original_category = str(data.get("document_category", "")).strip().lower()
     bill_like = _looks_like_invoice_bill(inv)
+    payment_like = _looks_like_payment_receipt(pay)
+    payment_not_bill = _is_payment_proof_not_medical_bill(pay, inv)
 
-    # Prefer a filled Rx over Textract letterhead leaks (GST/provider) into invoice_*.
-    if rx_score >= 3 and (
-        original_category == "prescription"
-        or not bill_like
-        or rx_score >= inv_score + 2
+    # PhonePe / UPI / bank screenshots: never keep as invoice when payment proof is strong
+    # and there is no real bill structure (invoice no / line items / provider+GST).
+    if payment_not_bill and rx_score < 3 and rep_score < 3:
+        _apply_payment_receipt_category(data, pay)
+        return
+
+    # Prefer filled medical docs over weak / false payment cues (email≠UPI, Axis≠bank).
+    if (
+        rx_score >= 3
+        and (
+            original_category == "prescription"
+            or not bill_like
+            or rx_score >= inv_score + 2
+        )
+        and (not payment_like or rx_score >= pay_score)
     ):
         data["is_medical_document"] = True
         data["document_category"] = "prescription"
@@ -1629,10 +2076,15 @@ def _recover_medical_classification(data: Dict[str, Any]) -> None:
             rx, str(data.get("prescription_subtype", "uncertain"))
         )
         data["non_medical_reason"] = ""
+        data["payment_receipt_parameters"] = {
+            key: "" for key in PAYMENT_RECEIPT_PARAM_KEYS
+        }
         return
 
-    if bill_like and (
-        inv_score >= 3 or (inv_score >= 2 and _is_filled(inv, "medicine_details"))
+    if (
+        bill_like
+        and not payment_not_bill
+        and (inv_score >= 3 or (inv_score >= 2 and _is_filled(inv, "medicine_details")))
     ):
         data["is_medical_document"] = True
         data["document_category"] = "invoice"
@@ -1641,9 +2093,18 @@ def _recover_medical_classification(data: Dict[str, Any]) -> None:
             data["invoice_subtype"] = "pharmacy"
         elif _looks_like_opd_consultation_invoice(inv):
             data["invoice_subtype"] = "opd_consultation"
+        if not payment_like:
+            data["payment_receipt_parameters"] = {
+                key: "" for key in PAYMENT_RECEIPT_PARAM_KEYS
+            }
         return
 
-    if bill_like and inv_score >= 2 and _looks_like_opd_consultation_invoice(inv):
+    if (
+        bill_like
+        and not payment_not_bill
+        and inv_score >= 2
+        and _looks_like_opd_consultation_invoice(inv)
+    ):
         data["is_medical_document"] = True
         data["document_category"] = "invoice"
         data["invoice_subtype"] = "opd_consultation"
@@ -1658,6 +2119,9 @@ def _recover_medical_classification(data: Dict[str, Any]) -> None:
             rx, str(data.get("prescription_subtype", "uncertain"))
         )
         data["non_medical_reason"] = ""
+        data["payment_receipt_parameters"] = {
+            key: "" for key in PAYMENT_RECEIPT_PARAM_KEYS
+        }
         return
 
     if rep_score >= 3:
@@ -1667,7 +2131,32 @@ def _recover_medical_classification(data: Dict[str, Any]) -> None:
         data["non_medical_reason"] = ""
         return
 
-    if _non_medical_reason_suggests_bill(data):
+    # Payment screenshots only after medical buckets are weak.
+    if payment_like and rx_score < 3 and rep_score < 3 and (
+        original_category in ("payment_receipt", "other", "", "invoice")
+        or pay_score >= inv_score + 2
+        or (not bill_like and pay_score >= 4)
+        or payment_not_bill
+    ):
+        _apply_payment_receipt_category(data, pay)
+        return
+
+    if (
+        original_category == "payment_receipt"
+        and payment_like
+        and pay_score >= 4
+        and rx_score < 3
+        and rep_score < 3
+    ):
+        _apply_payment_receipt_category(data, pay)
+        return
+
+    if payment_like or (pay_score >= 4 and _non_medical_reason_suggests_payment(data)):
+        if rx_score < 3 and rep_score < 3:
+            _apply_payment_receipt_category(data, pay)
+            return
+
+    if _non_medical_reason_suggests_bill(data) and not payment_not_bill:
         data["is_medical_document"] = True
         data["document_category"] = "invoice"
         reason = _str_val(data.get("non_medical_reason")).lower()
@@ -1676,7 +2165,10 @@ def _recover_medical_classification(data: Dict[str, Any]) -> None:
         else:
             data["invoice_subtype"] = "pharmacy"
         data["non_medical_reason"] = ""
+        return
 
+    if _non_medical_reason_suggests_payment(data) and pay_score >= 4 and rx_score < 3:
+        _apply_payment_receipt_category(data, pay)
 
 def _all_medical_blocks_empty(data: Dict[str, Any]) -> bool:
     rx = _normalize_params(
@@ -1690,19 +2182,29 @@ def _all_medical_blocks_empty(data: Dict[str, Any]) -> bool:
     rep = _normalize_params(
         data.get("report_parameters"), REPORT_PARAM_KEYS, _REPORT_ARRAY_KEYS
     )
+    pay = _normalize_params(
+        data.get("payment_receipt_parameters"), PAYMENT_RECEIPT_PARAM_KEYS, frozenset()
+    )
     return (
         _count_extracted_fields(rx) == 0
         and _count_extracted_fields(inv) == 0
         and _count_extracted_fields(rep) == 0
+        and _count_extracted_fields(pay) == 0
     )
 
 
 def _resolve_non_medical(
     data: Dict[str, Any], category: str
 ) -> Tuple[str, str, bool]:
-    """Return (category, reason, is_medical)."""
+    """Return (category, reason, is_claim_document).
+
+    is_claim_document covers medical docs and payment proofs.
+    """
     reason = _str_val(data.get("non_medical_reason"))
     is_medical = bool(data.get("is_medical_document", True))
+
+    if category == "payment_receipt":
+        return "payment_receipt", "", True
 
     if category == "other":
         return "other", reason or "Not a medical claim document", False
@@ -1710,14 +2212,14 @@ def _resolve_non_medical(
     if not is_medical and not _non_medical_reason_suggests_bill(data):
         return (
             "other",
-            reason or "Image is not a prescription, invoice, or lab report",
+            reason or "Image is not a prescription, invoice, lab report, or payment proof",
             False,
         )
 
     if _all_medical_blocks_empty(data) and not _non_medical_reason_suggests_bill(data):
         return (
             "other",
-            reason or "No prescription, bill, or report content found in the image",
+            reason or "No prescription, bill, report, or payment content found in the image",
             False,
         )
 
@@ -1730,6 +2232,22 @@ def _build_public_response(url: str, data: Dict[str, Any]) -> Dict[str, Any]:
     category = str(data.get("document_category", "other"))
     if category not in _VALID_CATEGORIES:
         category = "other"
+
+    # Safety net: UPI/PhonePe proof still labelled invoice after OpenAI leak into total_amount.
+    if category == "invoice":
+        inv_probe = _normalize_params(
+            data.get("invoice_parameters"), INVOICE_PARAM_KEYS, _INVOICE_ARRAY_KEYS
+        )
+        pay_probe = _normalize_params(
+            data.get("payment_receipt_parameters"),
+            PAYMENT_RECEIPT_PARAM_KEYS,
+            frozenset(),
+        )
+        _normalize_payment_receipt_fields(pay_probe)
+        _seed_payment_from_invoice_leak(pay_probe, inv_probe)
+        if _is_payment_proof_not_medical_bill(pay_probe, inv_probe):
+            _apply_payment_receipt_category(data, pay_probe)
+            category = "payment_receipt"
 
     inv_params = _normalize_params(
         data.get("invoice_parameters"), INVOICE_PARAM_KEYS, _INVOICE_ARRAY_KEYS
@@ -1750,12 +2268,13 @@ def _build_public_response(url: str, data: Dict[str, Any]) -> Dict[str, Any]:
         PRESCRIPTION_PARAM_KEYS,
         _PRESCRIPTION_ARRAY_KEYS,
     )
-    category = _correct_document_category(
-        doc_type, category, inv_params, rx_for_category
-    )
-    category, non_medical_reason, is_medical = _resolve_non_medical(data, category)
+    if category != "payment_receipt":
+        category = _correct_document_category(
+            doc_type, category, inv_params, rx_for_category
+        )
+    category, non_medical_reason, is_claim_doc = _resolve_non_medical(data, category)
 
-    if not is_medical:
+    if not is_claim_doc:
         return {
             "url": url,
             "is_medical_document": False,
@@ -1795,6 +2314,39 @@ def _build_public_response(url: str, data: Dict[str, Any]) -> Dict[str, Any]:
     )
     data["report_parameters"] = rep_params
 
+    pay_params = _normalize_params(
+        data.get("payment_receipt_parameters"), PAYMENT_RECEIPT_PARAM_KEYS, frozenset()
+    )
+    _normalize_payment_receipt_fields(pay_params)
+    data["payment_receipt_parameters"] = pay_params
+
+    if category == "payment_receipt":
+        parameters = pay_params
+        extra_checks = _payment_receipt_extra_checks(parameters)
+        completeness, missing_parameters = _completeness(
+            parameters,
+            PAYMENT_RECEIPT_REQUIRED,
+            tuple(extra_checks),
+        )
+        # Prefer payment bucket values over incidental invoice leaks.
+        unified = _merge_claim_field_buckets(
+            parameters, rx_params, inv_params, rep_params
+        )
+        return {
+            "url": url,
+            "is_medical_document": False,
+            "document_type": doc_type if doc_type != "uncertain" else "computer_generated",
+            "document_category": "payment_receipt",
+            "invoice_subtype": "not_applicable",
+            "prescription_subtype": "not_applicable",
+            "handwritten_percent": content_hw,
+            "computer_generated_percent": content_cg,
+            "completeness_percent": completeness,
+            "parameters": _to_all_claim_parameters(unified),
+            "missing_parameters": missing_parameters,
+            "message": "",
+        }
+
     if category == "prescription":
         parameters = rx_params
         prescription_subtype = _infer_prescription_subtype(
@@ -1831,7 +2383,9 @@ def _build_public_response(url: str, data: Dict[str, Any]) -> Dict[str, Any]:
         completeness, missing_parameters = _completeness(parameters, REPORT_REQUIRED, ())
 
     # Surface every filled field from all buckets — classification does not hide values.
-    unified = _merge_claim_field_buckets(rx_params, inv_params, rep_params, parameters)
+    unified = _merge_claim_field_buckets(
+        rx_params, inv_params, rep_params, pay_params, parameters
+    )
 
     return {
         "url": url,
@@ -1985,10 +2539,11 @@ def _call_openai_vision(
         SYSTEM_PROMPT,
         (
             "Classify content type and extract ALL visible parameters into every matching "
-            "bucket (prescription_parameters, invoice_parameters, report_parameters). "
-            "Do not skip a field because of document_category."
+            "bucket (prescription_parameters, invoice_parameters, report_parameters, "
+            "payment_receipt_parameters). Do not skip a field because of document_category."
             + page_note
-            + " Use document_category=other for app screenshots or non-medical images."
+            + " Use document_category=payment_receipt for UPI/bank/card payment screenshots. "
+            "Use document_category=other only for selfies, blank pages, or unrelated non-claim images."
         ),
         image_blocks,
         "medical_document_extraction",
