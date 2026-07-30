@@ -2,7 +2,8 @@
 AWS Textract OCR helpers for claim documents.
 
 Used with OpenAI Vision: Textract fills printed fields (GSTIN, invoice no,
-amounts, drug license); OpenAI classifies document type and medical fields.
+amounts, drug license, payment txn ids); OpenAI classifies document type
+and medical / payment fields.
 """
 
 from __future__ import annotations
@@ -89,6 +90,140 @@ _IOP_RE = re.compile(
     re.IGNORECASE,
 )
 _VA_RE = re.compile(r"\bVA\s*:?\s*([^\n]{3,40})", re.IGNORECASE)
+
+# --- Payment receipt / UPI / bank transfer cues ---
+# Require PSP-like handles; reject emails (info@hospital / name@domain.com).
+_UPI_ID_RE = re.compile(
+    r"\b([a-zA-Z0-9][a-zA-Z0-9._-]{1,64}@[a-zA-Z][a-zA-Z0-9]{1,20})\b"
+)
+_KNOWN_UPI_HANDLES = frozenset(
+    {
+        "upi",
+        "ybl",
+        "ibl",
+        "axl",
+        "apl",
+        "paytm",
+        "okhdfcbank",
+        "oksbi",
+        "okicici",
+        "okaxis",
+        "okbizaxis",
+        "waaxis",
+        "wahdfcbank",
+        "ptyes",
+        "ptaxis",
+        "yesbank",
+        "freecharge",
+        "amazonpay",
+        "ikwik",
+        "jupiteraxis",
+        "indus",
+        "kbl",
+        "barodampay",
+        "uboi",
+        "cbin",
+        "idbi",
+    }
+)
+_UTR_RE = re.compile(
+    r"(?:UTR(?:\s*(?:No\.?|Number|#))?|UPI\s*Ref(?:erence)?(?:\s*No\.?)?|"
+    r"Bank\s*Ref(?:erence)?(?:\s*No\.?)?)\s*[:#\-]?\s*([A-Z0-9]{8,30})",
+    re.IGNORECASE,
+)
+_TXN_ID_RE = re.compile(
+    r"(?:Txn(?:saction)?\s*(?:ID|Id|No\.?|#)|Transaction\s*(?:ID|Id|No\.?|#)|"
+    r"Payment\s*ID|RRN)\s*[:#\-]?\s*([A-Z0-9]{8,30})",
+    re.IGNORECASE,
+)
+_PAYMENT_AMOUNT_RE = re.compile(
+    r"(?:(?:paid|sent|transferred)\s+(?:of\s+)?)?"
+    r"(?:₹|rs\.?|inr)\s*([\d,]+\.?\d{0,2})"
+    r"|(?:(?:paid|amount\s*paid|total\s*paid)\s*[:\-]?\s*(?:₹|rs\.?|inr)?\s*"
+    r"([\d,]+\.?\d{0,2}))",
+    re.IGNORECASE,
+)
+_PAYMENT_DATE_RE = re.compile(
+    r"(?:(?:paid\s*on|transaction\s*date|payment\s*date)\s*[:\-]?\s*)"
+    r"(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}"
+    r"|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}"
+    r"|\d{4}-\d{2}-\d{2})",
+    re.IGNORECASE,
+)
+_PAYMENT_TIME_RE = re.compile(
+    r"\b(\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)\b"
+)
+_IFSC_RE = re.compile(r"\b([A-Z]{4}0[A-Z0-9]{6})\b", re.IGNORECASE)
+_MASKED_ACCT_RE = re.compile(
+    r"(?:A/?C|Account|Acc(?:ount)?\s*(?:No\.?)?)\s*[:#\-]?\s*"
+    r"([Xx*•·.\-\s]*\d{2,6})",
+    re.IGNORECASE,
+)
+_PAYEE_RE = re.compile(
+    r"(?:(?:paid|sent|transferred)\s+to|payee|merchant|beneficiary)"
+    r"\s*[:\-]?\s*([A-Za-z][A-Za-z0-9 .,&'\-]{2,60})",
+    re.IGNORECASE,
+)
+_PAYER_RE = re.compile(
+    r"(?:paid\s+by|debited\s+from|payer)\s*[:\-]?\s*"
+    r"([A-Za-z][A-Za-z0-9 .,&'\-]{2,60})",
+    re.IGNORECASE,
+)
+# Require "Bank" for short brands (Axis alone is a refraction column header).
+_BANK_NAME_RE = re.compile(
+    r"\b((?:HDFC|ICICI|SBI|State Bank of India|Kotak|IDFC|PNB|"
+    r"Bank of Baroda|Canara|IndusInd|IDBI|YES)\s+Bank"
+    r"|Axis\s+Bank|Yes\s+Bank|Union\s+Bank(?:\s+of\s+India)?|"
+    r"Federal\s+Bank)\b",
+    re.IGNORECASE,
+)
+_PAYMENT_APP_RE = re.compile(
+    r"\b(Google\s*Pay|GPay|PhonePe|Paytm|BHIM|Amazon\s*Pay|CRED|Mobikwik)\b",
+    re.IGNORECASE,
+)
+_PAYMENT_STATUS_RE = re.compile(
+    r"\b(payment\s+successful|transaction\s+successful|successfully\s+paid|"
+    r"payment\s+failed|transaction\s+failed|payment\s+pending|"
+    r"payment\s+successful|transaction\s+failed)\b",
+    re.IGNORECASE,
+)
+_PAYMENT_MODE_SIGNAL_RE = re.compile(
+    r"\b(UPI|NEFT|IMPS|RTGS|RTPS|credit\s*card|debit\s*card|net\s*banking|"
+    r"wallet)\b",
+    re.IGNORECASE,
+)
+_MEDICAL_DOC_CUE_RE = re.compile(
+    r"\b(?:OPD\s*SUMMARY|prescription|refraction|visual\s*acuity|\bIOP\b|"
+    r"chief\s*complaints|systemic\s*history|glasses\s*prescription|"
+    r"auto\s*refraction|pathologist|diagnosis|Dr\.?\s)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_plausible_upi_id(value: str) -> bool:
+    """Accept real UPI VPAs; reject emails / hospital footer addresses."""
+    raw = (value or "").strip()
+    if "@" not in raw or " " in raw:
+        return False
+    local, _, handle = raw.partition("@")
+    if not local or not handle:
+        return False
+    handle_l = handle.lower()
+    local_l = local.lower()
+    # Emails / domains
+    if "." in handle_l or handle_l.endswith(("com", "in", "org", "net", "co")):
+        return False
+    if local_l in {"info", "admin", "support", "contact", "hello", "mail", "email"}:
+        return False
+    if handle_l in _KNOWN_UPI_HANDLES:
+        return True
+    # Common PSP-style prefixes (ptaxis, okhdfcbank, …)
+    if re.match(r"^(ok|pt|yb|ibl|axl|apl|wa)", handle_l):
+        return True
+    # Unknown short handle only if local part looks like a user id (has digit)
+    if len(handle_l) <= 12 and any(ch.isdigit() for ch in local):
+        return True
+    return False
 
 
 def _extract_gstin(text: str) -> str:
@@ -297,6 +432,156 @@ def _normalize_amount(raw: str) -> str:
     return clean
 
 
+def _infer_payment_mode(text: str) -> str:
+    low = (text or "").lower()
+    if re.search(r"\b(upi|gpay|google\s*pay|phonepe|paytm|bhim|amazon\s*pay)\b", low):
+        return "upi"
+    if re.search(r"\b(neft|imps|rtgs|rtps|bank\s*transfer|net\s*banking)\b", low):
+        return "bank_transfer"
+    if re.search(r"\b(credit\s*card|debit\s*card|visa|mastercard|rupay|card)\b", low):
+        return "card"
+    if re.search(r"\bwallet\b", low):
+        return "wallet"
+    if re.search(r"\bcash\b", low):
+        return "cash"
+    mode = _PAYMENT_MODE_SIGNAL_RE.search(text or "")
+    if not mode:
+        return ""
+    token = mode.group(1).lower()
+    if token == "upi":
+        return "upi"
+    if token in ("neft", "imps", "rtgs", "rtps"):
+        return "bank_transfer"
+    if "card" in token:
+        return "card"
+    if token == "wallet":
+        return "wallet"
+    if token == "cash":
+        return "cash"
+    if "net" in token:
+        return "bank_transfer"
+    return ""
+
+
+def _infer_payment_status(text: str) -> str:
+    match = _PAYMENT_STATUS_RE.search(text or "")
+    if not match:
+        return ""
+    raw = match.group(1).lower()
+    if "fail" in raw or "declin" in raw:
+        return "failed"
+    if "pend" in raw:
+        return "pending"
+    if "complete" in raw:
+        return "completed"
+    if "success" in raw:
+        return "success"
+    return ""
+
+
+def _extract_payment_fields(text: str) -> Dict[str, str]:
+    """Best-effort payment proof fields from OCR text (empty when unknown)."""
+    out: Dict[str, str] = {
+        "payment_mode": "",
+        "payment_amount": "",
+        "transaction_date": "",
+        "transaction_id": "",
+        "reference_number": "",
+        "utr": "",
+        "payer_name": "",
+        "payee_name": "",
+        "upi_id": "",
+        "bank_name": "",
+        "payment_status": "",
+        "payment_time": "",
+        "account_number_masked": "",
+        "ifsc": "",
+        "remarks": "",
+    }
+    if not text:
+        return out
+
+    # Clinical / OPD pages often contain Axis/email/time noise — skip payment OCR.
+    if _MEDICAL_DOC_CUE_RE.search(text) and not (
+        _PAYMENT_APP_RE.search(text)
+        or re.search(r"\b(?:payment\s+successful|UTR|UPI\s*Ref|NEFT|IMPS)\b", text, re.I)
+    ):
+        return out
+
+    amt = _PAYMENT_AMOUNT_RE.search(text)
+    if amt:
+        amount = _normalize_amount(amt.group(1) or amt.group(2) or "")
+        try:
+            if amount and float(amount) > 0:
+                out["payment_amount"] = amount
+        except ValueError:
+            if amount:
+                out["payment_amount"] = amount
+
+    utr_m = _UTR_RE.search(text)
+    if utr_m:
+        out["utr"] = utr_m.group(1).strip()
+        out["transaction_id"] = out["utr"]
+        out["reference_number"] = out["utr"]
+
+    txn_m = _TXN_ID_RE.search(text)
+    if txn_m:
+        txn = txn_m.group(1).strip()
+        if not out["transaction_id"]:
+            out["transaction_id"] = txn
+        if not out["reference_number"]:
+            out["reference_number"] = txn
+
+    for upi_m in _UPI_ID_RE.finditer(text):
+        candidate = upi_m.group(1).strip()
+        if _is_plausible_upi_id(candidate):
+            out["upi_id"] = candidate
+            break
+
+    date_m = _PAYMENT_DATE_RE.search(text)
+    if date_m:
+        out["transaction_date"] = re.sub(r"\s+", " ", date_m.group(1)).strip()
+
+    ifsc_m = _IFSC_RE.search(text)
+    if ifsc_m:
+        out["ifsc"] = ifsc_m.group(1).upper()
+
+    acct_m = _MASKED_ACCT_RE.search(text)
+    if acct_m:
+        out["account_number_masked"] = re.sub(r"\s+", "", acct_m.group(1)).strip()
+
+    bank_m = _BANK_NAME_RE.search(text)
+    if bank_m:
+        out["bank_name"] = re.sub(r"\s+", " ", bank_m.group(1)).strip()
+
+    payee_m = _PAYEE_RE.search(text)
+    if payee_m:
+        candidate = re.sub(r"\s+", " ", payee_m.group(1)).strip(" :-")
+        if len(candidate) >= 3 and "@" not in candidate:
+            out["payee_name"] = candidate[:80]
+
+    payer_m = _PAYER_RE.search(text)
+    if payer_m:
+        candidate = re.sub(r"\s+", " ", payer_m.group(1)).strip(" :-")
+        if len(candidate) >= 3 and "@" not in candidate:
+            out["payer_name"] = candidate[:80]
+
+    out["payment_mode"] = _infer_payment_mode(text)
+    out["payment_status"] = _infer_payment_status(text)
+
+    # App name alone is a UPI cue when mode still empty.
+    if not out["payment_mode"] and _PAYMENT_APP_RE.search(text):
+        out["payment_mode"] = "upi"
+
+    # Time only when this already looks like a payment proof.
+    if out["payment_status"] or out["utr"] or out["upi_id"] or out["payment_mode"]:
+        time_m = _PAYMENT_TIME_RE.search(text)
+        if time_m:
+            out["payment_time"] = time_m.group(1).strip()
+
+    return out
+
+
 def _pick_bytes_for_sync(
     document_raw: bytes,
     page_images: Optional[List[bytes]] = None,
@@ -330,6 +615,21 @@ _EMPTY_OCR: Dict[str, str] = {
     "diagnosis": "",
     "visual_acuity_details": "",
     "provider_contact": "",
+    "payment_mode": "",
+    "payment_amount": "",
+    "transaction_date": "",
+    "transaction_id": "",
+    "reference_number": "",
+    "utr": "",
+    "payer_name": "",
+    "payee_name": "",
+    "upi_id": "",
+    "bank_name": "",
+    "payment_status": "",
+    "payment_time": "",
+    "account_number_masked": "",
+    "ifsc": "",
+    "remarks": "",
     "raw_text": "",
 }
 
@@ -424,6 +724,8 @@ def extract_textract_fields(
     if patient and provider and patient.lower() == provider.lower():
         patient = ""
 
+    payment = _extract_payment_fields(text)
+
     return {
         "gst_number": gst,
         "drug_license_number": "; ".join(licenses) if licenses else "",
@@ -441,6 +743,21 @@ def extract_textract_fields(
         "diagnosis": demo.get("diagnosis") or "",
         "visual_acuity_details": demo.get("visual_acuity_details") or "",
         "provider_contact": demo.get("provider_contact") or "",
+        "payment_mode": payment.get("payment_mode") or "",
+        "payment_amount": payment.get("payment_amount") or "",
+        "transaction_date": payment.get("transaction_date") or "",
+        "transaction_id": payment.get("transaction_id") or "",
+        "reference_number": payment.get("reference_number") or "",
+        "utr": payment.get("utr") or "",
+        "payer_name": payment.get("payer_name") or "",
+        "payee_name": payment.get("payee_name") or "",
+        "upi_id": payment.get("upi_id") or "",
+        "bank_name": payment.get("bank_name") or "",
+        "payment_status": payment.get("payment_status") or "",
+        "payment_time": payment.get("payment_time") or "",
+        "account_number_masked": payment.get("account_number_masked") or "",
+        "ifsc": payment.get("ifsc") or "",
+        "remarks": payment.get("remarks") or "",
         "raw_text": text,
     }
 
@@ -463,7 +780,7 @@ def merge_textract_into_openai_data(
     data: Dict[str, Any],
     ocr: Dict[str, str],
 ) -> None:
-    """Fill empty OpenAI invoice / Rx / report gaps with Textract OCR values."""
+    """Fill empty OpenAI invoice / Rx / report / payment gaps with Textract OCR values."""
     if not ocr:
         return
 
@@ -476,6 +793,8 @@ def merge_textract_into_openai_data(
     rx: Dict[str, Any] = dict(rx_raw) if isinstance(rx_raw, dict) else {}
     rep_raw = data.get("report_parameters")
     rep: Dict[str, Any] = dict(rep_raw) if isinstance(rep_raw, dict) else {}
+    pay_raw = data.get("payment_receipt_parameters")
+    pay: Dict[str, Any] = dict(pay_raw) if isinstance(pay_raw, dict) else {}
 
     invoice_fill_keys = (
         "gst_number",
@@ -506,6 +825,23 @@ def merge_textract_into_openai_data(
         "patient_age",
         "patient_gender",
     )
+    payment_fill_keys = (
+        "payment_mode",
+        "payment_amount",
+        "transaction_date",
+        "transaction_id",
+        "reference_number",
+        "utr",
+        "payer_name",
+        "payee_name",
+        "upi_id",
+        "bank_name",
+        "payment_status",
+        "payment_time",
+        "account_number_masked",
+        "ifsc",
+        "remarks",
+    )
 
     for key in invoice_fill_keys:
         ocr_val = (ocr.get(key) or "").strip()
@@ -521,6 +857,11 @@ def merge_textract_into_openai_data(
         ocr_val = (ocr.get(key) or "").strip()
         if ocr_val and _blank(rep.get(key)):
             rep[key] = ocr_val
+
+    for key in payment_fill_keys:
+        ocr_val = (ocr.get(key) or "").strip()
+        if ocr_val and _blank(pay.get(key)):
+            pay[key] = ocr_val
 
     # Prefer valid GSTIN from OCR even when OpenAI returned garbage.
     ocr_gst = (ocr.get("gst_number") or "").strip()
@@ -543,11 +884,58 @@ def merge_textract_into_openai_data(
         data["prescription_parameters"] = rx
     if rep:
         data["report_parameters"] = rep
+    if pay:
+        data["payment_receipt_parameters"] = pay
+
+    category = str(data.get("document_category", "other"))
+    # Strong payment proof only — never flip on a lone email-like "@" token.
+    payment_signal = bool(
+        (ocr.get("utr") or "").strip()
+        or (
+            (ocr.get("payment_amount") or "").strip()
+            and (ocr.get("payment_status") or "").strip()
+            and (ocr.get("payment_mode") or "").strip()
+        )
+        or (
+            _is_plausible_upi_id((ocr.get("upi_id") or "").strip())
+            and (ocr.get("payment_amount") or "").strip()
+            and (ocr.get("payment_status") or (ocr.get("transaction_id") or "")).strip()
+        )
+    )
+    medical_ocr = bool(
+        (ocr.get("doctor_name") or "").strip()
+        or (ocr.get("visual_acuity_details") or "").strip()
+        or (ocr.get("diagnosis") or "").strip()
+        or (
+            (ocr.get("consultation_date") or "").strip()
+            and (ocr.get("clinic_hospital_name") or "").strip()
+        )
+    )
+
+    # Payment proof cues override false "other" / accidental invoice labels.
+    if (
+        payment_signal
+        and not medical_ocr
+        and category in ("other", "", "invoice")
+    ):
+        # Don't override a real medical bill that also mentions UPI payment mode.
+        looks_bill = bool(
+            (ocr.get("gst_number") or "").strip()
+            or (
+                (ocr.get("invoice_number") or "").strip()
+                and (ocr.get("total_amount") or "").strip()
+            )
+        )
+        if category != "invoice" or not looks_bill:
+            data["is_medical_document"] = False
+            data["document_category"] = "payment_receipt"
+            return
 
     # If OpenAI missed category but expense OCR looks like a bill, nudge recovery.
     if not data.get("is_medical_document", True) and (
         ocr_gst or (ocr.get("invoice_number") and ocr.get("total_amount"))
     ):
-        data["is_medical_document"] = True
-        if str(data.get("document_category", "other")) in ("other", ""):
-            data["document_category"] = "invoice"
+        if category != "payment_receipt":
+            data["is_medical_document"] = True
+            if category in ("other", ""):
+                data["document_category"] = "invoice"
