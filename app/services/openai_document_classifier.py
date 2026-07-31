@@ -667,6 +667,38 @@ _VALID_PAYMENT_STATUSES = frozenset(
     {"success", "completed", "failed", "pending"}
 )
 
+# CRM `name` field → document_category
+_DOCUMENT_NAME_ALIASES = {
+    "invoice": "invoice",
+    "bill": "invoice",
+    "tax_invoice": "invoice",
+    "pharmacy_bill": "invoice",
+    "prescription": "prescription",
+    "rx": "prescription",
+    "opd": "prescription",
+    "opd_summary": "prescription",
+    "report": "report",
+    "lab": "report",
+    "lab_report": "report",
+    "diagnostic": "report",
+    "payment_receipt": "payment_receipt",
+    "payment": "payment_receipt",
+    "payment_proof": "payment_receipt",
+    "upi": "payment_receipt",
+    "upi_payment": "payment_receipt",
+    "bank_transfer": "payment_receipt",
+}
+
+
+def normalize_document_name_hint(raw: Any) -> str:
+    """Map CRM document name hint to a valid document_category (or "")."""
+    text = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not text:
+        return ""
+    if text in _VALID_CATEGORIES and text != "other":
+        return text
+    return _DOCUMENT_NAME_ALIASES.get(text, "")
+
 
 def _str_val(raw: Any) -> str:
     if raw is None:
@@ -2226,15 +2258,54 @@ def _resolve_non_medical(
     return category, "", True
 
 
-def _build_public_response(url: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    _recover_medical_classification(data)
+def _apply_category_hint(data: Dict[str, Any], category_hint: Optional[str]) -> None:
+    """Lock document_category to CRM-provided name when valid."""
+    hint = normalize_document_name_hint(category_hint)
+    if not hint:
+        return
+    data["document_category"] = hint
+    data["non_medical_reason"] = ""
+    if hint == "payment_receipt":
+        data["is_medical_document"] = False
+        data["invoice_subtype"] = "not_applicable"
+        data["prescription_subtype"] = "not_applicable"
+    elif hint == "prescription":
+        data["is_medical_document"] = True
+        data["invoice_subtype"] = "not_applicable"
+        # Drop false payment cues (email/Axis) on Rx pages.
+        data["payment_receipt_parameters"] = {
+            key: "" for key in PAYMENT_RECEIPT_PARAM_KEYS
+        }
+    elif hint == "invoice":
+        data["is_medical_document"] = True
+        data["prescription_subtype"] = "not_applicable"
+    elif hint == "report":
+        data["is_medical_document"] = True
+        data["invoice_subtype"] = "not_applicable"
+        data["prescription_subtype"] = "not_applicable"
+        data["payment_receipt_parameters"] = {
+            key: "" for key in PAYMENT_RECEIPT_PARAM_KEYS
+        }
+
+
+def _build_public_response(
+    url: str,
+    data: Dict[str, Any],
+    category_hint: Optional[str] = None,
+) -> Dict[str, Any]:
+    hint = normalize_document_name_hint(category_hint)
+    if hint:
+        # CRM label wins — skip auto recovery that flips invoice ↔ payment ↔ Rx.
+        _apply_category_hint(data, hint)
+    else:
+        _recover_medical_classification(data)
 
     category = str(data.get("document_category", "other"))
     if category not in _VALID_CATEGORIES:
         category = "other"
 
-    # Safety net: UPI/PhonePe proof still labelled invoice after OpenAI leak into total_amount.
-    if category == "invoice":
+    # Safety net only when CRM did not supply a category hint.
+    if not hint and category == "invoice":
         inv_probe = _normalize_params(
             data.get("invoice_parameters"), INVOICE_PARAM_KEYS, _INVOICE_ARRAY_KEYS
         )
@@ -2268,11 +2339,18 @@ def _build_public_response(url: str, data: Dict[str, Any]) -> Dict[str, Any]:
         PRESCRIPTION_PARAM_KEYS,
         _PRESCRIPTION_ARRAY_KEYS,
     )
-    if category != "payment_receipt":
+    if category != "payment_receipt" and not hint:
         category = _correct_document_category(
             doc_type, category, inv_params, rx_for_category
         )
-    category, non_medical_reason, is_claim_doc = _resolve_non_medical(data, category)
+    if hint:
+        category = hint
+        data["document_category"] = hint
+        non_medical_reason, is_claim_doc = "", True
+    else:
+        category, non_medical_reason, is_claim_doc = _resolve_non_medical(
+            data, category
+        )
 
     if not is_claim_doc:
         return {
@@ -2527,12 +2605,22 @@ def _call_openai_vision(
     client: Any,
     model: str,
     image_blocks: List[Dict[str, Any]],
+    category_hint: Optional[str] = None,
 ) -> Dict[str, Any]:
     page_note = (
         " Multiple pages attached — read all pages and merge extracted fields."
         if len(image_blocks) > 1
         else ""
     )
+    hint = normalize_document_name_hint(category_hint)
+    hint_note = ""
+    if hint:
+        hint_note = (
+            f" CALLER LABEL: document_category MUST be '{hint}'. "
+            f"Focus extraction on the matching parameters bucket for '{hint}', "
+            "but still fill any other visible fields into their buckets. "
+            "Do not reclassify away from the caller label."
+        )
     return _call_openai_json(
         client,
         model,
@@ -2542,8 +2630,16 @@ def _call_openai_vision(
             "bucket (prescription_parameters, invoice_parameters, report_parameters, "
             "payment_receipt_parameters). Do not skip a field because of document_category."
             + page_note
-            + " Use document_category=payment_receipt for UPI/bank/card payment screenshots. "
-            "Use document_category=other only for selfies, blank pages, or unrelated non-claim images."
+            + hint_note
+            + (
+                ""
+                if hint
+                else (
+                    " Use document_category=payment_receipt for UPI/bank/card payment "
+                    "screenshots. Use document_category=other only for selfies, blank "
+                    "pages, or unrelated non-claim images."
+                )
+            )
         ),
         image_blocks,
         "medical_document_extraction",
@@ -2716,9 +2812,13 @@ def _run_textract_ocr(doc: DocumentPages) -> Dict[str, str]:
         return {}
 
 
-def classify_document_url_openai(url: str) -> Dict[str, Any]:
+def classify_document_url_openai(
+    url: str,
+    category_hint: Optional[str] = None,
+) -> Dict[str, Any]:
     """Hybrid classify: Textract OCR + OpenAI Vision in parallel, then merge.
 
+    category_hint: optional CRM label (invoice / prescription / report / payment_receipt).
     Optional Vision GST/stamp refine is off by default (OPENAI_REFINE_PASSES).
     """
     started = time.perf_counter()
@@ -2727,22 +2827,31 @@ def classify_document_url_openai(url: str) -> Dict[str, Any]:
     doc = load_document(url)
     image_blocks = build_vision_blocks_from_document(doc)
     t_load = time.perf_counter()
+    hint = normalize_document_name_hint(category_hint)
 
     ocr: Dict[str, str] = {}
     if textract_enabled():
         with ThreadPoolExecutor(max_workers=2) as pool:
             fut_ocr = pool.submit(_run_textract_ocr, doc)
-            fut_ai = pool.submit(_call_openai_vision, client, model, image_blocks)
+            fut_ai = pool.submit(
+                _call_openai_vision, client, model, image_blocks, hint or None
+            )
             ocr = fut_ocr.result() or {}
             data = fut_ai.result()
     else:
-        data = _call_openai_vision(client, model, image_blocks)
+        data = _call_openai_vision(client, model, image_blocks, hint or None)
     t_main = time.perf_counter()
 
-    _recover_medical_classification(data)
+    if hint:
+        _apply_category_hint(data, hint)
+    else:
+        _recover_medical_classification(data)
     if ocr:
         merge_textract_into_openai_data(data, ocr)
-        _recover_medical_classification(data)
+        if hint:
+            _apply_category_hint(data, hint)
+        else:
+            _recover_medical_classification(data)
 
     refine_ms = 0.0
     if _OPENAI_REFINE_PASSES:
@@ -2766,11 +2875,14 @@ def classify_document_url_openai(url: str) -> Dict[str, Any]:
 
         if ocr:
             merge_textract_into_openai_data(data, ocr)
+            if hint:
+                _apply_category_hint(data, hint)
 
-    result = _build_public_response(url, data)
+    result = _build_public_response(url, data, category_hint=hint or None)
     logger.info(
-        "classify_document url=%s load_ms=%.0f main_ms=%.0f refine_ms=%.0f total_ms=%.0f",
+        "classify_document url=%s hint=%s load_ms=%.0f main_ms=%.0f refine_ms=%.0f total_ms=%.0f",
         url.split("/")[-1],
+        hint or "-",
         (t_load - started) * 1000.0,
         (t_main - t_load) * 1000.0,
         refine_ms,
