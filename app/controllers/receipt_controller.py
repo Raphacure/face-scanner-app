@@ -19,19 +19,19 @@ def _classify_parallel_workers(url_count: int) -> int:
     return max(1, min(workers, url_count, MAX_URLS))
 
 
-def _classify_one(index: int, url: str) -> Tuple[int, Dict[str, Any]]:
+def _classify_one(index: int, url: str, name: str) -> Tuple[int, Dict[str, Any]]:
     if index > 0 and _INTER_URL_DELAY_MS > 0:
         time.sleep(_INTER_URL_DELAY_MS / 1000.0)
     u = (url or "").strip()
     if not u:
         return index, {"url": url or "", "error": "empty url"}
     try:
-        return index, classify_document_url_openai(u)
+        return index, classify_document_url_openai(u, category_hint=name)
     except Exception as e:
         return index, {"url": u, "error": str(e)}
 
 
-def classify_receipt_prescription_urls_controller(urls: List[str]) -> Dict[str, Any]:
+def classify_receipt_prescription_urls_controller(urls: List[Any]) -> Dict[str, Any]:
     if not openai_configured():
         return {
             "status": "error",
@@ -45,17 +45,34 @@ def classify_receipt_prescription_urls_controller(urls: List[str]) -> Dict[str, 
             "message": f"At most {MAX_URLS} URLs allowed",
         }
 
-    workers = _classify_parallel_workers(len(urls))
+    items: List[Dict[str, str]] = []
+    for entry in urls:
+        if isinstance(entry, dict):
+            items.append(
+                {
+                    "url": str(entry.get("url") or "").strip(),
+                    "name": str(entry.get("name") or "").strip(),
+                }
+            )
+        else:
+            items.append(
+                {
+                    "url": str(getattr(entry, "url", "") or "").strip(),
+                    "name": str(getattr(entry, "name", "") or "").strip(),
+                }
+            )
+
+    workers = _classify_parallel_workers(len(items))
     indexed_results: List[Tuple[int, Dict[str, Any]]] = []
 
     if workers <= 1:
-        for index, url in enumerate(urls):
-            indexed_results.append(_classify_one(index, url))
+        for index, item in enumerate(items):
+            indexed_results.append(_classify_one(index, item["url"], item["name"]))
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [
-                pool.submit(_classify_one, index, url)
-                for index, url in enumerate(urls)
+                pool.submit(_classify_one, index, item["url"], item["name"])
+                for index, item in enumerate(items)
             ]
             for future in as_completed(futures):
                 indexed_results.append(future.result())
