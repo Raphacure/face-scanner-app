@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from fastapi import APIRouter
@@ -10,7 +10,10 @@ from app.controllers.receipt_controller import (
     get_classify_job_controller,
     submit_classify_job_controller,
 )
-from app.services.openai_document_classifier import normalize_document_name_hint
+from app.services.openai_document_classifier import (
+    normalize_document_name_hint,
+    normalize_extract_fields,
+)
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -24,6 +27,13 @@ class DocumentClassifyItem(BaseModel):
         min_length=1,
         description="invoice | prescription | report | payment_receipt",
     )
+    fields: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Optional subset of parameter keys to extract (faster). "
+            "Omit to extract all claim fields."
+        ),
+    )
 
     @field_validator("name")
     @classmethod
@@ -36,6 +46,16 @@ class DocumentClassifyItem(BaseModel):
             )
         return normalized
 
+    @field_validator("fields")
+    @classmethod
+    def _validate_fields(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return None
+        normalized = normalize_extract_fields(value)
+        if not normalized:
+            raise ValueError("fields must be a non-empty list of valid parameter names")
+        return list(normalized)
+
 
 class ReceiptPrescriptionClassifyRequest(BaseModel):
     """Classify claim documents (Textract OCR + OpenAI Vision hybrid)."""
@@ -46,7 +66,7 @@ class ReceiptPrescriptionClassifyRequest(BaseModel):
         ...,
         min_length=1,
         max_length=MAX_URLS,
-        description='Array of {"url", "name"} objects.',
+        description='Array of {"url", "name", optional "fields"} objects.',
     )
     async_job: bool = Field(
         default=False,
