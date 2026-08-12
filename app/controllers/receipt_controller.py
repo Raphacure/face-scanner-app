@@ -34,50 +34,63 @@ def _classify_parallel_workers(url_count: int) -> int:
     return max(1, min(workers, url_count, MAX_URLS))
 
 
-def _normalize_items(urls: List[Any]) -> List[Dict[str, str]]:
-    items: List[Dict[str, str]] = []
+def _normalize_items(urls: List[Any]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
     for entry in urls:
         if isinstance(entry, dict):
-            items.append(
-                {
-                    "url": str(entry.get("url") or "").strip(),
-                    "name": str(entry.get("name") or "").strip(),
-                }
-            )
+            item: Dict[str, Any] = {
+                "url": str(entry.get("url") or "").strip(),
+                "name": str(entry.get("name") or "").strip(),
+            }
+            fields = entry.get("fields")
+            if fields:
+                item["fields"] = list(fields)
         else:
-            items.append(
-                {
-                    "url": str(getattr(entry, "url", "") or "").strip(),
-                    "name": str(getattr(entry, "name", "") or "").strip(),
-                }
-            )
+            item = {
+                "url": str(getattr(entry, "url", "") or "").strip(),
+                "name": str(getattr(entry, "name", "") or "").strip(),
+            }
+            fields = getattr(entry, "fields", None)
+            if fields:
+                item["fields"] = list(fields)
+        items.append(item)
     return items
 
 
-def _classify_one(index: int, url: str, name: str) -> Tuple[int, Dict[str, Any]]:
+def _classify_one(index: int, url: str, name: str, fields: List[str] | None = None) -> Tuple[int, Dict[str, Any]]:
     if index > 0 and _INTER_URL_DELAY_MS > 0:
         time.sleep(_INTER_URL_DELAY_MS / 1000.0)
     u = (url or "").strip()
     if not u:
         return index, {"url": url or "", "name": name, "error": "empty url"}
     try:
-        return index, classify_document_url_openai(u, category_hint=name)
+        return index, classify_document_url_openai(
+            u, category_hint=name, extract_fields=fields
+        )
     except Exception as e:
         return index, {"url": u, "name": name, "error": str(e)}
 
 
-def _run_classify_batch(items: List[Dict[str, str]]) -> Dict[str, Any]:
+def _run_classify_batch(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     batch_started = time.perf_counter()
     workers = _classify_parallel_workers(len(items))
     indexed_results: List[Tuple[int, Dict[str, Any]]] = []
 
     if workers <= 1:
         for index, item in enumerate(items):
-            indexed_results.append(_classify_one(index, item["url"], item["name"]))
+            indexed_results.append(
+                _classify_one(index, item["url"], item["name"], item.get("fields"))
+            )
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [
-                pool.submit(_classify_one, index, item["url"], item["name"])
+                pool.submit(
+                    _classify_one,
+                    index,
+                    item["url"],
+                    item["name"],
+                    item.get("fields"),
+                )
                 for index, item in enumerate(items)
             ]
             for future in as_completed(futures):
@@ -116,7 +129,7 @@ def classify_receipt_prescription_urls_controller(urls: List[Any]) -> Dict[str, 
     return _run_classify_batch(_normalize_items(urls))
 
 
-def _process_classify_job(job_id: str, items: List[Dict[str, str]]) -> None:
+def _process_classify_job(job_id: str, items: List[Dict[str, Any]]) -> None:
     set_job_processing(job_id)
     try:
         result = _run_classify_batch(items)

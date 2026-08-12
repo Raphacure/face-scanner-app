@@ -255,14 +255,35 @@ _ALL_CLAIM_ARRAY_KEYS = (
 )
 
 
-def _empty_all_claim_parameters() -> Dict[str, Any]:
-    """Every extractable field, empty — fixed shape for main-service validation."""
-    return _normalize_params({}, ALL_CLAIM_PARAM_KEYS, _ALL_CLAIM_ARRAY_KEYS)
-
-
 def _to_all_claim_parameters(partial: Dict[str, Any]) -> Dict[str, Any]:
     """Overlay category extraction onto the full claim field schema."""
     return _normalize_params(partial, ALL_CLAIM_PARAM_KEYS, _ALL_CLAIM_ARRAY_KEYS)
+
+
+def _requested_array_keys(fields: Sequence[str]) -> frozenset[str]:
+    return frozenset(
+        key
+        for key in fields
+        if key in _ALL_CLAIM_ARRAY_KEYS or key == "prescribed_medicines"
+    )
+
+
+def _to_requested_parameters(
+    partial: Dict[str, Any],
+    extract_fields: Sequence[str],
+) -> Dict[str, Any]:
+    """Return only CRM-requested keys (slim response)."""
+    keys = tuple(extract_fields)
+    return _normalize_params(partial, keys, _requested_array_keys(keys))
+
+
+def _finalize_parameters(
+    partial: Dict[str, Any],
+    extract_fields: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    if extract_fields:
+        return _to_requested_parameters(partial, extract_fields)
+    return _to_all_claim_parameters(partial)
 
 
 def _merge_claim_field_buckets(*buckets: Dict[str, Any]) -> Dict[str, Any]:
@@ -700,6 +721,152 @@ def normalize_document_name_hint(raw: Any) -> str:
     return _DOCUMENT_NAME_ALIASES.get(text, "")
 
 
+_FIELD_TO_BUCKET: Dict[str, str] = {}
+for _key in PRESCRIPTION_PARAM_KEYS:
+    _FIELD_TO_BUCKET[_key] = "prescription"
+for _key in INVOICE_PARAM_KEYS:
+    _FIELD_TO_BUCKET[_key] = "invoice"
+for _key in REPORT_PARAM_KEYS:
+    _FIELD_TO_BUCKET[_key] = "report"
+for _key in PAYMENT_RECEIPT_PARAM_KEYS:
+    _FIELD_TO_BUCKET[_key] = "payment"
+
+_EMPTY_OBJECT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": False,
+}
+
+
+def normalize_extract_fields(raw: Any) -> Optional[Tuple[str, ...]]:
+    """Validate and dedupe CRM requested parameter keys (subset of ALL_CLAIM_PARAM_KEYS)."""
+    if not raw or not isinstance(raw, (list, tuple)):
+        return None
+    normalized: List[str] = []
+    for item in raw:
+        key = str(item or "").strip()
+        if key in ALL_CLAIM_PARAM_KEYS and key not in normalized:
+            normalized.append(key)
+    return tuple(normalized) if normalized else None
+
+
+def _fields_by_bucket(fields: Sequence[str]) -> Dict[str, List[str]]:
+    buckets: Dict[str, List[str]] = {
+        "prescription": [],
+        "invoice": [],
+        "report": [],
+        "payment": [],
+    }
+    for field in fields:
+        bucket = _FIELD_TO_BUCKET.get(field)
+        if bucket:
+            buckets[bucket].append(field)
+    return buckets
+
+
+def _slim_prescription_params_schema(keys: Sequence[str]) -> Dict[str, Any]:
+    props: Dict[str, Any] = {}
+    for key in keys:
+        if key == "prescribed_medicines":
+            props[key] = {"type": "array", "items": _MEDICINE_ITEM_SCHEMA}
+        elif key in _PRESCRIPTION_ARRAY_KEYS:
+            props[key] = _STRING_ARRAY
+        else:
+            props[key] = {"type": "string"}
+    return {
+        "type": "object",
+        "properties": props,
+        "required": list(keys),
+        "additionalProperties": False,
+    }
+
+
+def _build_slim_document_schema(fields: Sequence[str]) -> Dict[str, Any]:
+    """Smaller OpenAI schema — only buckets/keys CRM asked for."""
+    by_bucket = _fields_by_bucket(fields)
+    rx_keys = by_bucket["prescription"]
+    inv_keys = by_bucket["invoice"]
+    rep_keys = by_bucket["report"]
+    pay_keys = by_bucket["payment"]
+    return {
+        "type": "object",
+        "properties": {
+            "document_type": {
+                "type": "string",
+                "enum": ["handwritten", "computer_generated", "uncertain"],
+            },
+            "content_handwritten_percent": {"type": "number"},
+            "content_computer_generated_percent": {"type": "number"},
+            "is_medical_document": {"type": "boolean"},
+            "non_medical_reason": {"type": "string"},
+            "document_category": {
+                "type": "string",
+                "enum": ["prescription", "invoice", "report", "payment_receipt", "other"],
+            },
+            "invoice_subtype": {
+                "type": "string",
+                "enum": [
+                    "pharmacy",
+                    "diagnostic",
+                    "opd_consultation",
+                    "dental",
+                    "eye_care",
+                    "uncertain",
+                    "not_applicable",
+                ],
+            },
+            "prescription_subtype": {
+                "type": "string",
+                "enum": [
+                    "opd",
+                    "pharmacy",
+                    "diagnostic",
+                    "dental",
+                    "eye_care",
+                    "uncertain",
+                    "not_applicable",
+                ],
+            },
+            "prescription_parameters": (
+                _slim_prescription_params_schema(rx_keys)
+                if rx_keys
+                else _EMPTY_OBJECT_SCHEMA
+            ),
+            "invoice_parameters": (
+                _param_object_schema(inv_keys, _INVOICE_ARRAY_KEYS)
+                if inv_keys
+                else _EMPTY_OBJECT_SCHEMA
+            ),
+            "report_parameters": (
+                _param_object_schema(rep_keys, _REPORT_ARRAY_KEYS)
+                if rep_keys
+                else _EMPTY_OBJECT_SCHEMA
+            ),
+            "payment_receipt_parameters": (
+                _param_object_schema(pay_keys, frozenset())
+                if pay_keys
+                else _EMPTY_OBJECT_SCHEMA
+            ),
+        },
+        "required": [
+            "document_type",
+            "content_handwritten_percent",
+            "content_computer_generated_percent",
+            "is_medical_document",
+            "non_medical_reason",
+            "document_category",
+            "invoice_subtype",
+            "prescription_subtype",
+            "prescription_parameters",
+            "invoice_parameters",
+            "report_parameters",
+            "payment_receipt_parameters",
+        ],
+        "additionalProperties": False,
+    }
+
+
 def use_textract_for_category_hint(hint: str) -> bool:
     """When CRM sends name, skip Textract except for invoices (saves ~15–30s per file)."""
     if not textract_enabled():
@@ -729,6 +896,34 @@ def _openai_max_tokens_for_hint(hint: str) -> int:
         return max(1200, int(os.getenv("OPENAI_MAX_TOKENS", "2200")))
     except ValueError:
         return 2200
+
+
+def _openai_max_tokens_for_request(
+    hint: str,
+    extract_fields: Optional[Sequence[str]] = None,
+) -> int:
+    """Tighter token cap when CRM sends an explicit field list."""
+    base = _openai_max_tokens_for_hint(hint)
+    if not extract_fields:
+        return base
+    estimated = min(1000, max(400, 350 + len(extract_fields) * 45))
+    try:
+        cap = int(os.getenv("OPENAI_FIELDS_MAX_TOKENS", str(estimated)))
+    except ValueError:
+        cap = estimated
+    return max(400, min(cap, base))
+
+
+def _fields_need_doctor_reg_refine(extract_fields: Optional[Sequence[str]]) -> bool:
+    if not extract_fields:
+        return True
+    return "doctor_registration_number" in extract_fields or "doctor_stamp" in extract_fields
+
+
+def _fields_need_gst_refine(extract_fields: Optional[Sequence[str]]) -> bool:
+    if not extract_fields:
+        return True
+    return "gst_number" in extract_fields or "drug_license_number" in extract_fields
 
 
 def _str_val(raw: Any) -> str:
@@ -797,11 +992,6 @@ def _normalize_params(
         else:
             result[key] = _str_val(data.get(key))
     return result
-
-
-def _merge_string_field(target: Dict[str, Any], key: str, value: str) -> None:
-    if _str_val(value) and not _str_val(target.get(key)):
-        target[key] = _str_val(value)
 
 
 def _normalize_doctor_registration(params: Dict[str, Any]) -> None:
@@ -1094,23 +1284,6 @@ def _pharmacy_gst_only_missing(inv: Dict[str, Any]) -> bool:
 
 def _invoice_gst_missing(inv: Dict[str, Any]) -> bool:
     return not _extract_gstin(_str_val(inv.get("gst_number")))
-
-
-_pharmacy_gst_missing = _invoice_gst_missing
-
-
-def _pharmacy_regulatory_incomplete(inv: Dict[str, Any]) -> bool:
-    return _pharmacy_regulatory_invalid(inv)
-
-
-def _invoice_authorization_missing(inv: Dict[str, Any]) -> bool:
-    """Stamp or signature at bill footer — either counts when visible."""
-    return not _is_filled(inv, "authorized_stamp") and not _is_filled(
-        inv, "authorized_signature"
-    )
-
-
-
 
 
 def _normalize_total_amount(params: Dict[str, Any]) -> None:
@@ -2319,10 +2492,16 @@ def _apply_category_hint(data: Dict[str, Any], category_hint: Optional[str]) -> 
         }
 
 
-def _with_request_name(result: Dict[str, Any], hint: str) -> Dict[str, Any]:
-    """Echo CRM request name on each result for downstream validation matching."""
+def _with_request_name(
+    result: Dict[str, Any],
+    hint: str,
+    extract_fields: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Echo CRM request name/fields on each result for downstream validation matching."""
     if hint:
         result["name"] = hint
+    if extract_fields:
+        result["fields"] = list(extract_fields)
     return result
 
 
@@ -2330,6 +2509,7 @@ def _build_public_response(
     url: str,
     data: Dict[str, Any],
     category_hint: Optional[str] = None,
+    extract_fields: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     hint = normalize_document_name_hint(category_hint)
     if hint:
@@ -2402,11 +2582,12 @@ def _build_public_response(
                 "handwritten_percent": content_hw,
                 "computer_generated_percent": content_cg,
                 "completeness_percent": 0.0,
-                "parameters": _empty_all_claim_parameters(),
+                "parameters": _finalize_parameters({}, extract_fields),
                 "missing_parameters": ["not_a_medical_document"],
                 "message": non_medical_reason,
             },
             hint,
+            extract_fields,
         )
 
     prescription_subtype = "not_applicable"
@@ -2442,14 +2623,19 @@ def _build_public_response(
     if category == "payment_receipt":
         parameters = pay_params
         extra_checks = _payment_receipt_extra_checks(parameters)
-        completeness, missing_parameters = _completeness(
-            parameters,
-            PAYMENT_RECEIPT_REQUIRED,
-            tuple(extra_checks),
+        required_fields = (
+            tuple(extract_fields)
+            if extract_fields
+            else PAYMENT_RECEIPT_REQUIRED
         )
-        # Prefer payment bucket values over incidental invoice leaks.
         unified = _merge_claim_field_buckets(
             parameters, rx_params, inv_params, rep_params
+        )
+        check_params = unified if extract_fields else parameters
+        completeness, missing_parameters = _completeness(
+            check_params,
+            required_fields,
+            tuple(extra_checks) if not extract_fields else (),
         )
         return _with_request_name(
             {
@@ -2462,11 +2648,12 @@ def _build_public_response(
                 "handwritten_percent": content_hw,
                 "computer_generated_percent": content_cg,
                 "completeness_percent": completeness,
-                "parameters": _to_all_claim_parameters(unified),
+                "parameters": _finalize_parameters(unified, extract_fields),
                 "missing_parameters": missing_parameters,
                 "message": "",
             },
             hint,
+            extract_fields,
         )
 
     if category == "prescription":
@@ -2474,10 +2661,18 @@ def _build_public_response(
         prescription_subtype = _infer_prescription_subtype(
             parameters, str(data.get("prescription_subtype", "uncertain"))
         )
-        required = PRESCRIPTION_SUBTYPE_REQUIRED.get(
-            prescription_subtype, PRESCRIPTION_REQUIRED
+        required = (
+            tuple(extract_fields)
+            if extract_fields
+            else PRESCRIPTION_SUBTYPE_REQUIRED.get(
+                prescription_subtype, PRESCRIPTION_REQUIRED
+            )
         )
-        extra_checks = _prescription_subtype_extra_checks(prescription_subtype, parameters)
+        extra_checks = (
+            ()
+            if extract_fields
+            else _prescription_subtype_extra_checks(prescription_subtype, parameters)
+        )
         completeness, missing_parameters = _completeness(
             parameters,
             required,
@@ -2488,10 +2683,15 @@ def _build_public_response(
         invoice_subtype = _infer_invoice_subtype(
             parameters, str(data.get("invoice_subtype", "uncertain"))
         )
-        extra_checks = _invoice_subtype_extra_checks(invoice_subtype, parameters)
+        extra_checks = (
+            ()
+            if extract_fields
+            else _invoice_subtype_extra_checks(invoice_subtype, parameters)
+        )
+        required = tuple(extract_fields) if extract_fields else INVOICE_REQUIRED
         completeness, missing_parameters = _completeness(
             parameters,
-            INVOICE_REQUIRED,
+            required,
             tuple(extra_checks),
         )
     else:
@@ -2502,7 +2702,8 @@ def _build_public_response(
         )
         doc_type = _apply_document_type(data)
         content_hw, content_cg = _content_percent_split(data)
-        completeness, missing_parameters = _completeness(parameters, REPORT_REQUIRED, ())
+        required = tuple(extract_fields) if extract_fields else REPORT_REQUIRED
+        completeness, missing_parameters = _completeness(parameters, required, ())
 
     # Surface every filled field from all buckets — classification does not hide values.
     unified = _merge_claim_field_buckets(
@@ -2520,11 +2721,12 @@ def _build_public_response(
             "handwritten_percent": content_hw,
             "computer_generated_percent": content_cg,
             "completeness_percent": completeness,
-            "parameters": _to_all_claim_parameters(unified),
+            "parameters": _finalize_parameters(unified, extract_fields),
             "missing_parameters": missing_parameters,
             "message": "",
         },
         hint,
+        extract_fields,
     )
 
 
@@ -2653,6 +2855,7 @@ def _call_openai_vision(
     model: str,
     image_blocks: List[Dict[str, Any]],
     category_hint: Optional[str] = None,
+    extract_fields: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     page_note = (
         " Multiple pages attached — read all pages and merge extracted fields."
@@ -2660,19 +2863,35 @@ def _call_openai_vision(
         else ""
     )
     hint = normalize_document_name_hint(category_hint)
+    field_list = tuple(extract_fields or ())
     hint_note = ""
     if hint:
         hint_note = (
             f" CALLER LABEL: document_category MUST be '{hint}'. "
-            f"Focus extraction on the matching parameters bucket for '{hint}', "
-            "but still fill any other visible fields into their buckets. "
             "Do not reclassify away from the caller label."
         )
-    return _call_openai_json(
-        client,
-        model,
-        SYSTEM_PROMPT,
-        (
+    if field_list:
+        targets = ", ".join(field_list)
+        user_text = (
+            "Classify content type and extract ONLY the requested parameter keys below. "
+            "Put each key in its correct bucket (prescription_parameters / invoice_parameters / "
+            "report_parameters / payment_receipt_parameters). "
+            f"TARGET FIELDS: {targets}. "
+            "Leave every other parameter key as \"\" or []. Do not invent values."
+            + page_note
+            + hint_note
+        )
+        schema = _build_slim_document_schema(field_list)
+        max_tokens = _openai_max_tokens_for_request(hint or "", field_list)
+    else:
+        if hint:
+            hint_note = (
+                f" CALLER LABEL: document_category MUST be '{hint}'. "
+                f"Focus extraction on the matching parameters bucket for '{hint}', "
+                "but still fill any other visible fields into their buckets. "
+                "Do not reclassify away from the caller label."
+            )
+        user_text = (
             "Classify content type and extract ALL visible parameters into every matching "
             "bucket (prescription_parameters, invoice_parameters, report_parameters, "
             "payment_receipt_parameters). Do not skip a field because of document_category."
@@ -2687,11 +2906,18 @@ def _call_openai_vision(
                     "pages, or unrelated non-claim images."
                 )
             )
-        ),
+        )
+        schema = DOCUMENT_SCHEMA
+        max_tokens = _openai_max_tokens_for_request(hint or "", None)
+    return _call_openai_json(
+        client,
+        model,
+        SYSTEM_PROMPT,
+        user_text,
         image_blocks,
         "medical_document_extraction",
-        DOCUMENT_SCHEMA,
-        _openai_max_tokens_for_hint(hint or ""),
+        schema,
+        max_tokens,
     )
 
 
@@ -2862,10 +3088,12 @@ def _run_textract_ocr(doc: DocumentPages) -> Dict[str, str]:
 def classify_document_url_openai(
     url: str,
     category_hint: Optional[str] = None,
+    extract_fields: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Hybrid classify: Textract OCR + OpenAI Vision in parallel, then merge.
 
     category_hint: optional CRM label (invoice / prescription / report / payment_receipt).
+    extract_fields: optional subset of parameter keys — slimmer schema, faster extraction.
     Optional Vision GST/stamp refine is off by default (OPENAI_REFINE_PASSES).
     """
     started = time.perf_counter()
@@ -2875,6 +3103,7 @@ def classify_document_url_openai(
     image_blocks = build_vision_blocks_from_document(doc)
     t_load = time.perf_counter()
     hint = normalize_document_name_hint(category_hint)
+    fields = normalize_extract_fields(extract_fields)
     run_textract = use_textract_for_category_hint(hint)
 
     ocr: Dict[str, str] = {}
@@ -2882,12 +3111,19 @@ def classify_document_url_openai(
         with ThreadPoolExecutor(max_workers=2) as pool:
             fut_ocr = pool.submit(_run_textract_ocr, doc)
             fut_ai = pool.submit(
-                _call_openai_vision, client, model, image_blocks, hint or None
+                _call_openai_vision,
+                client,
+                model,
+                image_blocks,
+                hint or None,
+                fields,
             )
             ocr = fut_ocr.result() or {}
             data = fut_ai.result()
     else:
-        data = _call_openai_vision(client, model, image_blocks, hint or None)
+        data = _call_openai_vision(
+            client, model, image_blocks, hint or None, fields
+        )
     t_main = time.perf_counter()
 
     if hint:
@@ -2905,16 +3141,19 @@ def classify_document_url_openai(
     if _OPENAI_REFINE_PASSES:
         t_refine0 = time.perf_counter()
         try:
-            if _peek_pharmacy_regulatory_needs_refine(
-                data
-            ) or _peek_invoice_gst_needs_refine(data):
+            if _fields_need_gst_refine(fields) and (
+                _peek_pharmacy_regulatory_needs_refine(data)
+                or _peek_invoice_gst_needs_refine(data)
+            ):
                 _pause_between_openai_calls()
                 _refine_gst_dl_if_needed(client, model, image_blocks, data, doc)
         except Exception:
             logger.exception("GST/DL header pass failed for %s", url)
 
         try:
-            if _peek_doctor_registration_needs_refine(data):
+            if _fields_need_doctor_reg_refine(fields) and _peek_doctor_registration_needs_refine(
+                data
+            ):
                 _pause_between_openai_calls()
                 _refine_doctor_registration_stamp(client, model, data, doc)
         except Exception:
@@ -2926,7 +3165,9 @@ def classify_document_url_openai(
             if hint:
                 _apply_category_hint(data, hint)
 
-    result = _build_public_response(url, data, category_hint=hint or None)
+    result = _build_public_response(
+        url, data, category_hint=hint or None, extract_fields=fields
+    )
     total_ms = (time.perf_counter() - started) * 1000.0
     result["processing_time_ms"] = round(total_ms, 1)
     logger.info(
