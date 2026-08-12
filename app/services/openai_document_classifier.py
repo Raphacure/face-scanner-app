@@ -700,6 +700,37 @@ def normalize_document_name_hint(raw: Any) -> str:
     return _DOCUMENT_NAME_ALIASES.get(text, "")
 
 
+def use_textract_for_category_hint(hint: str) -> bool:
+    """When CRM sends name, skip Textract except for invoices (saves ~15–30s per file)."""
+    if not textract_enabled():
+        return False
+    normalized = normalize_document_name_hint(hint)
+    if not normalized:
+        return True
+    only_invoice = (os.getenv("TEXTRACT_HINT_INVOICE_ONLY") or "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if only_invoice:
+        return normalized == "invoice"
+    return True
+
+
+def _openai_max_tokens_for_hint(hint: str) -> int:
+    """Smaller cap when category is known — faster responses, same field coverage."""
+    if normalize_document_name_hint(hint):
+        try:
+            return max(800, int(os.getenv("OPENAI_HINT_MAX_TOKENS", "1400")))
+        except ValueError:
+            return 1400
+    try:
+        return max(1200, int(os.getenv("OPENAI_MAX_TOKENS", "2200")))
+    except ValueError:
+        return 2200
+
+
 def _str_val(raw: Any) -> str:
     if raw is None:
         return ""
@@ -2288,6 +2319,13 @@ def _apply_category_hint(data: Dict[str, Any], category_hint: Optional[str]) -> 
         }
 
 
+def _with_request_name(result: Dict[str, Any], hint: str) -> Dict[str, Any]:
+    """Echo CRM request name on each result for downstream validation matching."""
+    if hint:
+        result["name"] = hint
+    return result
+
+
 def _build_public_response(
     url: str,
     data: Dict[str, Any],
@@ -2353,20 +2391,23 @@ def _build_public_response(
         )
 
     if not is_claim_doc:
-        return {
-            "url": url,
-            "is_medical_document": False,
-            "document_type": doc_type,
-            "document_category": "other",
-            "invoice_subtype": "not_applicable",
-            "prescription_subtype": "not_applicable",
-            "handwritten_percent": content_hw,
-            "computer_generated_percent": content_cg,
-            "completeness_percent": 0.0,
-            "parameters": _empty_all_claim_parameters(),
-            "missing_parameters": ["not_a_medical_document"],
-            "message": non_medical_reason,
-        }
+        return _with_request_name(
+            {
+                "url": url,
+                "is_medical_document": False,
+                "document_type": doc_type,
+                "document_category": "other",
+                "invoice_subtype": "not_applicable",
+                "prescription_subtype": "not_applicable",
+                "handwritten_percent": content_hw,
+                "computer_generated_percent": content_cg,
+                "completeness_percent": 0.0,
+                "parameters": _empty_all_claim_parameters(),
+                "missing_parameters": ["not_a_medical_document"],
+                "message": non_medical_reason,
+            },
+            hint,
+        )
 
     prescription_subtype = "not_applicable"
     invoice_subtype = "not_applicable"
@@ -2410,20 +2451,23 @@ def _build_public_response(
         unified = _merge_claim_field_buckets(
             parameters, rx_params, inv_params, rep_params
         )
-        return {
-            "url": url,
-            "is_medical_document": False,
-            "document_type": doc_type if doc_type != "uncertain" else "computer_generated",
-            "document_category": "payment_receipt",
-            "invoice_subtype": "not_applicable",
-            "prescription_subtype": "not_applicable",
-            "handwritten_percent": content_hw,
-            "computer_generated_percent": content_cg,
-            "completeness_percent": completeness,
-            "parameters": _to_all_claim_parameters(unified),
-            "missing_parameters": missing_parameters,
-            "message": "",
-        }
+        return _with_request_name(
+            {
+                "url": url,
+                "is_medical_document": False,
+                "document_type": doc_type if doc_type != "uncertain" else "computer_generated",
+                "document_category": "payment_receipt",
+                "invoice_subtype": "not_applicable",
+                "prescription_subtype": "not_applicable",
+                "handwritten_percent": content_hw,
+                "computer_generated_percent": content_cg,
+                "completeness_percent": completeness,
+                "parameters": _to_all_claim_parameters(unified),
+                "missing_parameters": missing_parameters,
+                "message": "",
+            },
+            hint,
+        )
 
     if category == "prescription":
         parameters = rx_params
@@ -2465,20 +2509,23 @@ def _build_public_response(
         rx_params, inv_params, rep_params, pay_params, parameters
     )
 
-    return {
-        "url": url,
-        "is_medical_document": True,
-        "document_type": doc_type,
-        "document_category": category,
-        "invoice_subtype": invoice_subtype,
-        "prescription_subtype": prescription_subtype,
-        "handwritten_percent": content_hw,
-        "computer_generated_percent": content_cg,
-        "completeness_percent": completeness,
-        "parameters": _to_all_claim_parameters(unified),
-        "missing_parameters": missing_parameters,
-        "message": "",
-    }
+    return _with_request_name(
+        {
+            "url": url,
+            "is_medical_document": True,
+            "document_type": doc_type,
+            "document_category": category,
+            "invoice_subtype": invoice_subtype,
+            "prescription_subtype": prescription_subtype,
+            "handwritten_percent": content_hw,
+            "computer_generated_percent": content_cg,
+            "completeness_percent": completeness,
+            "parameters": _to_all_claim_parameters(unified),
+            "missing_parameters": missing_parameters,
+            "message": "",
+        },
+        hint,
+    )
 
 
 
@@ -2644,7 +2691,7 @@ def _call_openai_vision(
         image_blocks,
         "medical_document_extraction",
         DOCUMENT_SCHEMA,
-        2200,
+        _openai_max_tokens_for_hint(hint or ""),
     )
 
 
@@ -2828,9 +2875,10 @@ def classify_document_url_openai(
     image_blocks = build_vision_blocks_from_document(doc)
     t_load = time.perf_counter()
     hint = normalize_document_name_hint(category_hint)
+    run_textract = use_textract_for_category_hint(hint)
 
     ocr: Dict[str, str] = {}
-    if textract_enabled():
+    if run_textract:
         with ThreadPoolExecutor(max_workers=2) as pool:
             fut_ocr = pool.submit(_run_textract_ocr, doc)
             fut_ai = pool.submit(
@@ -2879,13 +2927,16 @@ def classify_document_url_openai(
                 _apply_category_hint(data, hint)
 
     result = _build_public_response(url, data, category_hint=hint or None)
+    total_ms = (time.perf_counter() - started) * 1000.0
+    result["processing_time_ms"] = round(total_ms, 1)
     logger.info(
-        "classify_document url=%s hint=%s load_ms=%.0f main_ms=%.0f refine_ms=%.0f total_ms=%.0f",
+        "classify_document url=%s hint=%s textract=%s load_ms=%.0f main_ms=%.0f refine_ms=%.0f total_ms=%.0f",
         url.split("/")[-1],
         hint or "-",
+        run_textract,
         (t_load - started) * 1000.0,
         (t_main - t_load) * 1000.0,
         refine_ms,
-        (time.perf_counter() - started) * 1000.0,
+        total_ms,
     )
     return result
