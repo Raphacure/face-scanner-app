@@ -255,11 +255,6 @@ _ALL_CLAIM_ARRAY_KEYS = (
 )
 
 
-def _empty_all_claim_parameters() -> Dict[str, Any]:
-    """Every extractable field, empty — fixed shape for main-service validation."""
-    return _normalize_params({}, ALL_CLAIM_PARAM_KEYS, _ALL_CLAIM_ARRAY_KEYS)
-
-
 def _to_all_claim_parameters(partial: Dict[str, Any]) -> Dict[str, Any]:
     """Overlay category extraction onto the full claim field schema."""
     return _normalize_params(partial, ALL_CLAIM_PARAM_KEYS, _ALL_CLAIM_ARRAY_KEYS)
@@ -999,11 +994,6 @@ def _normalize_params(
     return result
 
 
-def _merge_string_field(target: Dict[str, Any], key: str, value: str) -> None:
-    if _str_val(value) and not _str_val(target.get(key)):
-        target[key] = _str_val(value)
-
-
 def _normalize_doctor_registration(params: Dict[str, Any]) -> None:
     """Fill doctor_registration_number from stamp/name text; support CN No. labels."""
     reg = _str_val(params.get("doctor_registration_number"))
@@ -1294,23 +1284,6 @@ def _pharmacy_gst_only_missing(inv: Dict[str, Any]) -> bool:
 
 def _invoice_gst_missing(inv: Dict[str, Any]) -> bool:
     return not _extract_gstin(_str_val(inv.get("gst_number")))
-
-
-_pharmacy_gst_missing = _invoice_gst_missing
-
-
-def _pharmacy_regulatory_incomplete(inv: Dict[str, Any]) -> bool:
-    return _pharmacy_regulatory_invalid(inv)
-
-
-def _invoice_authorization_missing(inv: Dict[str, Any]) -> bool:
-    """Stamp or signature at bill footer — either counts when visible."""
-    return not _is_filled(inv, "authorized_stamp") and not _is_filled(
-        inv, "authorized_signature"
-    )
-
-
-
 
 
 def _normalize_total_amount(params: Dict[str, Any]) -> None:
