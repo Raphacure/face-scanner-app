@@ -22,15 +22,15 @@ _INTER_URL_DELAY_MS = max(0, int(os.getenv("OPENAI_INTER_URL_DELAY_MS", "0")))
 _JOB_POLL_INTERVAL_MS = max(500, int(os.getenv("CLASSIFY_JOB_POLL_INTERVAL_MS", "2000")))
 
 _job_executor = ThreadPoolExecutor(
-    max_workers=max(1, int(os.getenv("CLASSIFY_JOB_MAX_PARALLEL", "3")))
+    max_workers=max(1, int(os.getenv("CLASSIFY_JOB_MAX_PARALLEL", "1")))
 )
 
 
 def _classify_parallel_workers(url_count: int) -> int:
     try:
-        workers = int(os.getenv("OPENAI_CLASSIFY_MAX_PARALLEL", "6"))
+        workers = int(os.getenv("OPENAI_CLASSIFY_MAX_PARALLEL", "2"))
     except ValueError:
-        workers = 6
+        workers = 2
     return max(1, min(workers, url_count, MAX_URLS))
 
 

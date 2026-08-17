@@ -79,7 +79,7 @@ class ReceiptPrescriptionClassifyRequest(BaseModel):
 
 
 @router.post("/classify-receipt")
-def classify_receipt_prescription(payload: ReceiptPrescriptionClassifyRequest):
+async def classify_receipt_prescription(payload: ReceiptPrescriptionClassifyRequest):
     """Extract fields using CRM-provided document name.
 
     Sync (default): waits and returns results (may hit 60s gateway timeout).
@@ -93,7 +93,7 @@ def classify_receipt_prescription(payload: ReceiptPrescriptionClassifyRequest):
 
 
 @router.get("/classify-receipt/jobs/{job_id}")
-def get_classify_receipt_job(job_id: str):
+async def get_classify_receipt_job(job_id: str):
     """Poll async classify job until status is success or error."""
     body = get_classify_job_controller(job_id)
     if body.get("status") in ("pending", "processing"):
