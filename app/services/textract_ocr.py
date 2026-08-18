@@ -887,6 +887,15 @@ def merge_textract_into_openai_data(
     if pay:
         data["payment_receipt_parameters"] = pay
 
+    params_raw = data.get("parameters")
+    params: Dict[str, Any] = dict(params_raw) if isinstance(params_raw, dict) else {}
+    for key, raw in ocr.items():
+        ocr_val = str(raw or "").strip()
+        if ocr_val and _blank(params.get(key)):
+            params[key] = ocr_val
+    if params:
+        data["parameters"] = params
+
     category = str(data.get("document_category", "other"))
     # Strong payment proof only — never flip on a lone email-like "@" token.
     payment_signal = bool(

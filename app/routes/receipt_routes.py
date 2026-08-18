@@ -30,8 +30,9 @@ class DocumentClassifyItem(BaseModel):
     fields: Optional[List[str]] = Field(
         default=None,
         description=(
-            "Optional subset of parameter keys to extract (faster). "
-            "Omit to extract all claim fields."
+            "Field names to extract from this document. "
+            "The OpenAI schema is built from this list. "
+            "Omit to extract the full default claim catalog."
         ),
     )
 
@@ -53,7 +54,10 @@ class DocumentClassifyItem(BaseModel):
             return None
         normalized = normalize_extract_fields(value)
         if not normalized:
-            raise ValueError("fields must be a non-empty list of valid parameter names")
+            raise ValueError(
+                "fields must be a non-empty list of field names "
+                "(letters, numbers, underscore)"
+            )
         return list(normalized)
 
 

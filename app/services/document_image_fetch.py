@@ -29,8 +29,8 @@ def _pdf_render_dpi() -> int:
 
 
 def pdf_vision_max_pages() -> int:
-    """Pages sent on the main classification call (full PDF can have many pages)."""
-    return _env_int("PDF_VISION_MAX_PAGES", 1, 1, MAX_PDF_PAGES)
+    """Pages sent on the main classification call (scanned Rx packs are often 2–5 pages)."""
+    return _env_int("PDF_VISION_MAX_PAGES", MAX_PDF_PAGES, 1, MAX_PDF_PAGES)
 
 
 def pdf_refine_max_pages() -> int:
@@ -133,6 +133,28 @@ def pdf_page_count(raw: bytes) -> int:
     doc = fitz.open(stream=raw, filetype="pdf")
     try:
         return doc.page_count
+    finally:
+        doc.close()
+
+
+def extract_pdf_text(raw: bytes, max_pages: int = 2) -> str:
+    """Plain text from a PDF text layer (empty for scanned image-only PDFs)."""
+    if not is_pdf_bytes(raw):
+        return ""
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return ""
+    try:
+        doc = fitz.open(stream=raw, filetype="pdf")
+    except Exception:
+        return ""
+    try:
+        if doc.page_count == 0:
+            return ""
+        limit = min(doc.page_count, max(1, max_pages))
+        parts = [doc.load_page(index).get_text("text") or "" for index in range(limit)]
+        return "\n".join(parts)
     finally:
         doc.close()
 
@@ -251,7 +273,7 @@ def download_image_data_url(url: str) -> Tuple[str, bytes]:
 
 
 def build_vision_image_blocks(url: str) -> Tuple[List[Dict[str, Any]], bytes]:
-    """OpenAI Vision blocks — PDFs limited to PDF_VISION_MAX_PAGES (default 1)."""
+    """OpenAI Vision blocks — PDFs limited to PDF_VISION_MAX_PAGES (default all, cap 5)."""
     doc = load_document(url)
     detail = _vision_image_detail()
     limit = pdf_vision_max_pages() if doc.is_pdf else len(doc.page_images)
@@ -498,17 +520,32 @@ def build_stamp_blocks_from_document(
     document_raw: bytes,
     doc: DocumentPages | None = None,
 ) -> List[Dict[str, Any]]:
-    """Vision blocks focused on doctor stamp / signature zone."""
-    page_bytes = _document_page_bytes(document_raw, doc)
-    if not page_bytes:
+    """Vision blocks focused on doctor stamp / signature zone (last pages of a PDF)."""
+    if doc is not None and doc.page_images:
+        pages = list(doc.page_images)
+    elif is_pdf_bytes(document_raw):
+        pages = render_pdf_page_images(document_raw, pdf_vision_max_pages())
+    else:
+        pages = [document_raw] if document_raw else []
+    if not pages:
         return []
-    return [
-        {
-            "type": "image_url",
-            "image_url": {"url": crop_url, "detail": "high"},
-        }
-        for crop_url in build_stamp_crop_urls(page_bytes)
-    ]
+    # Prescribed-by / Regn no / signature usually sit on the last clinical page(s),
+    # not on a leading flow-chart or cover photo.
+    targets = pages[-2:] if len(pages) > 1 else pages[:1]
+    blocks: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for page_bytes in targets:
+        for crop_url in build_stamp_crop_urls(page_bytes):
+            if crop_url in seen:
+                continue
+            seen.add(crop_url)
+            blocks.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": crop_url, "detail": "high"},
+                }
+            )
+    return blocks
 
 
 def build_refine_image_blocks(

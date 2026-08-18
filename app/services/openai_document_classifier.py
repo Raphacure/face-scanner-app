@@ -24,7 +24,9 @@ from app.services.document_image_fetch import (
     build_regulatory_header_blocks,
     build_stamp_blocks_from_document,
     build_vision_blocks_from_document,
+    extract_pdf_text,
     load_document,
+    pdf_vision_max_pages,
 )
 from app.services.textract_ocr import (
     extract_textract_fields,
@@ -286,6 +288,42 @@ def _finalize_parameters(
     return _to_all_claim_parameters(partial)
 
 
+def _parameters_from_extraction(
+    data: Dict[str, Any],
+    extract_fields: Sequence[str],
+) -> Dict[str, Any]:
+    """Build the public parameters map from model output using the API field list."""
+    partial: Dict[str, Any] = {}
+    array_keys = _requested_array_keys(extract_fields)
+    sources = (
+        data.get("parameters"),
+        data.get("prescription_parameters"),
+        data.get("invoice_parameters"),
+        data.get("report_parameters"),
+        data.get("payment_receipt_parameters"),
+    )
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in extract_fields:
+            raw = source.get(key)
+            if key == "prescribed_medicines":
+                if not partial.get(key) and isinstance(raw, list) and raw:
+                    partial[key] = raw
+                continue
+            if key in array_keys:
+                if not partial.get(key) and isinstance(raw, list) and raw:
+                    partial[key] = raw
+                continue
+            if _is_meaningful_string(raw) and not _is_meaningful_string(partial.get(key)):
+                partial[key] = _str_val(raw)
+    params = _to_requested_parameters(partial, extract_fields)
+    _normalize_report_fields(params)
+    _normalize_doctor_name_value(params)
+    _normalize_doctor_registration(params)
+    return params
+
+
 def _merge_claim_field_buckets(*buckets: Dict[str, Any]) -> Dict[str, Any]:
     """Union non-empty fields across Rx / invoice / report / payment buckets (first wins)."""
     merged: Dict[str, Any] = {}
@@ -310,8 +348,9 @@ def _merge_claim_field_buckets(*buckets: Dict[str, Any]) -> Dict[str, Any]:
 
 _DOCTOR_REG_IN_TEXT_RE = re.compile(
     r"(?:RMC|MCI|MMC|HPMC|HIMC|DMC|CN\.?\s*NO\.?|C\.?\s*N\.?\s*NO\.?|"
-    r"council\s*(?:reg(?:istration)?|no\.?)|reg\.?\s*no\.?|regd\.?\s*no\.?|"
-    r"registration\s*no\.?)\s*[:\s#-]*([A-Za-z0-9][A-Za-z0-9/\-]{1,20})",
+    r"council\s*(?:reg(?:istration)?|no\.?)|regn\.?\s*no\.?|reg\.?\s*no\.?|"
+    r"regd\.?\s*no\.?|registration\s*no\.?)\s*[:\s#-]*"
+    r"([A-Za-z0-9][A-Za-z0-9/\-]{1,20})",
     re.IGNORECASE,
 )
 _DOCTOR_REG_DIGITS_RE = re.compile(r"\b(\d{4,8}(?:/\d{2,6})?)\b")
@@ -531,7 +570,7 @@ MUST extract gst_number (15-char GSTIN only, no label) from top header/top-right
 GSTIN may appear as **GSTIN:** **02AAHCHxxxxxZx** — strip * and return the code. Never FSSAI/CST/RST.
 Pharmacy: drug_license_number (all DL lines, join "; "); medicine_details[] "name | Qty | Rate | Batch | Exp".
 OPD: consultation_charges, registration_charges, service_details[].
-Diagnostic: sample_collection_date, test_details[] "Test — Rs amt".
+Diagnostic: sample_collection_date (Registered On / Collected On / Received On), test_details[] "Test — Rs amt".
 Dental/eye: item_details[] procedures or frame/lens lines.
 
 PAYMENT_RECEIPT (mandatory when visible — do not invent):
@@ -565,6 +604,20 @@ Do NOT use CR No / Patient Registration / Token No / Mobile / MR No as doctor_re
 doctor_stamp / doctor_signature: "present" if visible but illegible; still try to read CN/Reg from stamp text.
 
 REPORT: specific test_names (not section titles), test_results, dates, pathologist_*, laboratory_*.
+sample_collection_date aliases (MUST fill when printed): Registered On, Sample Collected On,
+Collected On, Collection Date, Received On, Sample Received, Drawn On, Scan Date, Examination Date.
+Radiology/HRCT/CT/MRI/X-ray: no blood/urine sample — Registered On / Scan Date IS sample_collection_date.
+report_date aliases: Reported On, Report Date, Date of Report, Released On.
+Return dates as YYYY-MM-DD. Never leave sample_collection_date empty when Registered On is printed.
+"""
+
+FIELDS_SYSTEM_PROMPT = """Indian medical claims OCR. Fill JSON; use "" / [] if a value is not printed.
+Put extracted values in parameters using the exact keys the caller requested.
+Read EVERY attached page (multi-page PDFs). Headers AND footers matter:
+Prescribed by / (Dr. Name) / Regn no are often at the bottom of a later page.
+Map visible labels onto the requested keys. Do not invent values.
+Dates as YYYY-MM-DD when possible. Signatures/stamps: "present" if visible but illegible.
+Handwritten vs computer_generated percents must sum to 100.
 """
 
 PHARMACY_REGULATORY_SCHEMA: Dict[str, Any] = {
@@ -721,74 +774,41 @@ def normalize_document_name_hint(raw: Any) -> str:
     return _DOCUMENT_NAME_ALIASES.get(text, "")
 
 
-_FIELD_TO_BUCKET: Dict[str, str] = {}
-for _key in PRESCRIPTION_PARAM_KEYS:
-    _FIELD_TO_BUCKET[_key] = "prescription"
-for _key in INVOICE_PARAM_KEYS:
-    _FIELD_TO_BUCKET[_key] = "invoice"
-for _key in REPORT_PARAM_KEYS:
-    _FIELD_TO_BUCKET[_key] = "report"
-for _key in PAYMENT_RECEIPT_PARAM_KEYS:
-    _FIELD_TO_BUCKET[_key] = "payment"
-
-_EMPTY_OBJECT_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "properties": {},
-    "required": [],
-    "additionalProperties": False,
-}
+_FIELD_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 
 
 def normalize_extract_fields(raw: Any) -> Optional[Tuple[str, ...]]:
-    """Validate and dedupe CRM requested parameter keys (subset of ALL_CLAIM_PARAM_KEYS)."""
+    """Dedupe caller field names from the API body. Any identifier is allowed."""
     if not raw or not isinstance(raw, (list, tuple)):
         return None
     normalized: List[str] = []
     for item in raw:
         key = str(item or "").strip()
-        if key in ALL_CLAIM_PARAM_KEYS and key not in normalized:
+        if _FIELD_NAME_RE.match(key) and key not in normalized:
             normalized.append(key)
     return tuple(normalized) if normalized else None
 
 
-def _fields_by_bucket(fields: Sequence[str]) -> Dict[str, List[str]]:
-    buckets: Dict[str, List[str]] = {
-        "prescription": [],
-        "invoice": [],
-        "report": [],
-        "payment": [],
-    }
-    for field in fields:
-        bucket = _FIELD_TO_BUCKET.get(field)
-        if bucket:
-            buckets[bucket].append(field)
-    return buckets
+def _schema_for_field(key: str) -> Dict[str, Any]:
+    if key == "prescribed_medicines":
+        return {"type": "array", "items": _MEDICINE_ITEM_SCHEMA}
+    if key in _ALL_CLAIM_ARRAY_KEYS:
+        return _STRING_ARRAY
+    return {"type": "string"}
 
 
-def _slim_prescription_params_schema(keys: Sequence[str]) -> Dict[str, Any]:
-    props: Dict[str, Any] = {}
-    for key in keys:
-        if key == "prescribed_medicines":
-            props[key] = {"type": "array", "items": _MEDICINE_ITEM_SCHEMA}
-        elif key in _PRESCRIPTION_ARRAY_KEYS:
-            props[key] = _STRING_ARRAY
-        else:
-            props[key] = {"type": "string"}
+def _parameters_schema_from_fields(fields: Sequence[str]) -> Dict[str, Any]:
+    """JSON schema for parameters — keys come from the API `fields` list."""
     return {
         "type": "object",
-        "properties": props,
-        "required": list(keys),
+        "properties": {key: _schema_for_field(key) for key in fields},
+        "required": list(fields),
         "additionalProperties": False,
     }
 
 
 def _build_slim_document_schema(fields: Sequence[str]) -> Dict[str, Any]:
-    """Smaller OpenAI schema — only buckets/keys CRM asked for."""
-    by_bucket = _fields_by_bucket(fields)
-    rx_keys = by_bucket["prescription"]
-    inv_keys = by_bucket["invoice"]
-    rep_keys = by_bucket["report"]
-    pay_keys = by_bucket["payment"]
+    """OpenAI schema driven by the request `fields` list, not a hardcoded catalog."""
     return {
         "type": "object",
         "properties": {
@@ -800,54 +820,7 @@ def _build_slim_document_schema(fields: Sequence[str]) -> Dict[str, Any]:
             "content_computer_generated_percent": {"type": "number"},
             "is_medical_document": {"type": "boolean"},
             "non_medical_reason": {"type": "string"},
-            "document_category": {
-                "type": "string",
-                "enum": ["prescription", "invoice", "report", "payment_receipt", "other"],
-            },
-            "invoice_subtype": {
-                "type": "string",
-                "enum": [
-                    "pharmacy",
-                    "diagnostic",
-                    "opd_consultation",
-                    "dental",
-                    "eye_care",
-                    "uncertain",
-                    "not_applicable",
-                ],
-            },
-            "prescription_subtype": {
-                "type": "string",
-                "enum": [
-                    "opd",
-                    "pharmacy",
-                    "diagnostic",
-                    "dental",
-                    "eye_care",
-                    "uncertain",
-                    "not_applicable",
-                ],
-            },
-            "prescription_parameters": (
-                _slim_prescription_params_schema(rx_keys)
-                if rx_keys
-                else _EMPTY_OBJECT_SCHEMA
-            ),
-            "invoice_parameters": (
-                _param_object_schema(inv_keys, _INVOICE_ARRAY_KEYS)
-                if inv_keys
-                else _EMPTY_OBJECT_SCHEMA
-            ),
-            "report_parameters": (
-                _param_object_schema(rep_keys, _REPORT_ARRAY_KEYS)
-                if rep_keys
-                else _EMPTY_OBJECT_SCHEMA
-            ),
-            "payment_receipt_parameters": (
-                _param_object_schema(pay_keys, frozenset())
-                if pay_keys
-                else _EMPTY_OBJECT_SCHEMA
-            ),
+            "parameters": _parameters_schema_from_fields(fields),
         },
         "required": [
             "document_type",
@@ -855,13 +828,7 @@ def _build_slim_document_schema(fields: Sequence[str]) -> Dict[str, Any]:
             "content_computer_generated_percent",
             "is_medical_document",
             "non_medical_reason",
-            "document_category",
-            "invoice_subtype",
-            "prescription_subtype",
-            "prescription_parameters",
-            "invoice_parameters",
-            "report_parameters",
-            "payment_receipt_parameters",
+            "parameters",
         ],
         "additionalProperties": False,
     }
@@ -906,7 +873,7 @@ def _openai_max_tokens_for_request(
     base = _openai_max_tokens_for_hint(hint)
     if not extract_fields:
         return base
-    estimated = min(1000, max(400, 350 + len(extract_fields) * 45))
+    estimated = min(1800, max(700, 500 + len(extract_fields) * 80))
     try:
         cap = int(os.getenv("OPENAI_FIELDS_MAX_TOKENS", str(estimated)))
     except ValueError:
@@ -994,8 +961,22 @@ def _normalize_params(
     return result
 
 
+def _normalize_doctor_name_value(params: Dict[str, Any]) -> None:
+    """Strip Prescribed by / parentheses wrappers from a printed doctor name."""
+    if "doctor_name" not in params:
+        return
+    name = _str_val(params.get("doctor_name"))
+    if not name or name.lower() == "present":
+        return
+    name = re.sub(r"^(?:prescribed\s*by\s*:?\s*)", "", name, flags=re.I)
+    name = name.strip("() ").strip()
+    name = re.sub(r"\s+", " ", name)
+    params["doctor_name"] = name
+
+
 def _normalize_doctor_registration(params: Dict[str, Any]) -> None:
     """Fill doctor_registration_number from stamp/name text; support CN No. labels."""
+    _normalize_doctor_name_value(params)
     reg = _str_val(params.get("doctor_registration_number"))
     if reg and reg.lower() != "present":
         cn = _CN_NO_RE.search(reg) or _DOCTOR_REG_IN_TEXT_RE.search(reg)
@@ -1045,6 +1026,171 @@ def _is_meaningful_string(val: Any) -> bool:
     if not s:
         return False
     return s not in _PLACEHOLDER_VALUES
+
+
+_UNICODE_SPACE_RE = re.compile(r"[\u00a0\u202f\u2007\u2009\u200b]")
+_TIME_SUFFIX_RE = re.compile(
+    r"\s+\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp]\.?[Mm]\.?)?$",
+)
+_MONTH_LOOKUP = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+_NAMED_DATE_RE = re.compile(
+    r"^(\d{1,2})[/\-.\s]([A-Za-z]{3,9})[/\-.\s](\d{2,4})$"
+)
+_YMD_DATE_RE = re.compile(r"^(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})$")
+_DMY_DATE_RE = re.compile(r"^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})$")
+_DATE_VALUE_RE = (
+    r"(\d{1,2}[/\-.\s](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*"
+    r"[/\-.\s]\d{2,4}"
+    r"(?:\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AaPp]\.?[Mm]\.?)?)?"
+    r"|\d{4}[/\-.]\d{1,2}[/\-.]\d{1,2}"
+    r"(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?"
+    r"|\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}"
+    r"(?:\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AaPp]\.?[Mm]\.?)?)?)"
+)
+_SAMPLE_COLLECTION_LABEL_RE = re.compile(
+    r"(?:"
+    r"sample\s*collected(?:\s*on)?"
+    r"|sample\s*collection\s*date"
+    r"|sample\s*received(?:\s*on)?"
+    r"|sample\s*date"
+    r"|collected\s*on"
+    r"|collection\s*date"
+    r"|registered\s*on"
+    r"|registration\s*date"
+    r"|date\s*of\s*registration"
+    r"|received\s*on"
+    r"|received\s*date"
+    r"|drawn\s*on"
+    r"|specimen\s*(?:collected|date)"
+    r"|scan\s*date"
+    r"|date\s*of\s*scan"
+    r"|examination\s*date"
+    r"|date\s*of\s*examination"
+    r"|date\s*of\s*(?:investigation|procedure|study)"
+    r"|investigation\s*date"
+    r"|procedure\s*date"
+    r")\s*[:\-]?\s*"
+    + _DATE_VALUE_RE,
+    re.IGNORECASE,
+)
+_REPORT_DATE_LABEL_RE = re.compile(
+    r"(?:"
+    r"reported\s*on"
+    r"|report\s*date"
+    r"|date\s*of\s*report"
+    r"|date\s*reported"
+    r"|released\s*on"
+    r"|report\s*released"
+    r"|verified\s*on"
+    r")\s*[:\-]?\s*"
+    + _DATE_VALUE_RE,
+    re.IGNORECASE,
+)
+
+
+def _collapse_ws(raw: str) -> str:
+    return re.sub(r"\s+", " ", _UNICODE_SPACE_RE.sub(" ", raw)).strip()
+
+
+def _normalize_to_iso_date(raw: Any) -> str:
+    """Normalize printed Indian dates to YYYY-MM-DD; keep original if unparseable."""
+    original = _str_val(raw)
+    text = _TIME_SUFFIX_RE.sub("", _collapse_ws(original)).strip(" .,;")
+    if not text:
+        return ""
+
+    named = _NAMED_DATE_RE.match(text)
+    if named:
+        day_s, month_s, year_s = named.groups()
+        month = _MONTH_LOOKUP.get(month_s.lower()) or _MONTH_LOOKUP.get(month_s.lower()[:3])
+        if month:
+            year = int(year_s)
+            if year < 100:
+                year += 2000
+            day = int(day_s)
+            if 1 <= day <= 31:
+                return f"{year:04d}-{month:02d}-{day:02d}"
+
+    ymd = _YMD_DATE_RE.match(text)
+    if ymd:
+        year, month, day = (int(part) for part in ymd.groups())
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return f"{year:04d}-{month:02d}-{day:02d}"
+
+    dmy = _DMY_DATE_RE.match(text)
+    if dmy:
+        day, month, year = (int(part) for part in dmy.groups())
+        if year < 100:
+            year += 2000
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return f"{year:04d}-{month:02d}-{day:02d}"
+    return original
+
+
+def _extract_labeled_date(text: str, pattern: re.Pattern[str]) -> str:
+    match = pattern.search(_UNICODE_SPACE_RE.sub(" ", text))
+    if not match:
+        return ""
+    return _normalize_to_iso_date(match.group(1))
+
+
+def _fill_labeled_dates_from_text(data: Dict[str, Any], text: str) -> None:
+    """Fill empty sample_collection_date / report_date from labeled PDF/OCR text."""
+    if not text or not text.strip():
+        return
+    sample = _extract_labeled_date(text, _SAMPLE_COLLECTION_LABEL_RE)
+    report = _extract_labeled_date(text, _REPORT_DATE_LABEL_RE)
+    if not sample and not report:
+        return
+
+    assignments = (
+        ("parameters", "sample_collection_date", sample),
+        ("report_parameters", "sample_collection_date", sample),
+        ("invoice_parameters", "sample_collection_date", sample),
+        ("parameters", "report_date", report),
+        ("report_parameters", "report_date", report),
+    )
+    for bucket_key, field, value in assignments:
+        if not value:
+            continue
+        bucket = data.get(bucket_key)
+        if not isinstance(bucket, dict):
+            bucket = {}
+            data[bucket_key] = bucket
+        if not _is_meaningful_string(bucket.get(field)):
+            bucket[field] = value
+
+
+def _normalize_report_fields(params: Dict[str, Any]) -> None:
+    for key in ("sample_collection_date", "report_date"):
+        val = _str_val(params.get(key))
+        if val:
+            params[key] = _normalize_to_iso_date(val)
 
 
 _GSTIN_PREFIX_RE = re.compile(
@@ -1367,6 +1513,9 @@ def _normalize_invoice_fields(params: Dict[str, Any]) -> None:
     _normalize_invoice_placeholders(params)
     _normalize_total_amount(params)
     _normalize_invoice_gst(params)
+    sample = _str_val(params.get("sample_collection_date"))
+    if sample:
+        params["sample_collection_date"] = _normalize_to_iso_date(sample)
     if _looks_like_pharmacy_invoice(params, {}):
         _normalize_pharmacy_drug_license(params)
 
@@ -2518,6 +2667,55 @@ def _build_public_response(
     else:
         _recover_medical_classification(data)
 
+    if extract_fields:
+        category = hint or str(data.get("document_category", "other"))
+        if category not in _VALID_CATEGORIES:
+            category = "other"
+        doc_type = _apply_document_type(data)
+        content_hw, content_cg = _content_percent_split(data)
+        parameters = _parameters_from_extraction(data, extract_fields)
+        completeness, missing_parameters = _completeness(
+            parameters, extract_fields, ()
+        )
+        invoice_subtype = str(data.get("invoice_subtype") or "not_applicable")
+        if invoice_subtype not in _VALID_INVOICE_SUBTYPES:
+            invoice_subtype = "not_applicable"
+        prescription_subtype = str(data.get("prescription_subtype") or "not_applicable")
+        if prescription_subtype not in _VALID_PRESCRIPTION_SUBTYPES:
+            prescription_subtype = "not_applicable"
+        if category == "report":
+            invoice_subtype = "not_applicable"
+            prescription_subtype = "not_applicable"
+        elif category == "prescription":
+            invoice_subtype = "not_applicable"
+            if prescription_subtype in ("not_applicable", "uncertain", ""):
+                prescription_subtype = _infer_prescription_subtype(
+                    parameters, prescription_subtype or "uncertain"
+                )
+        elif category == "invoice":
+            prescription_subtype = "not_applicable"
+        elif category == "payment_receipt":
+            invoice_subtype = "not_applicable"
+            prescription_subtype = "not_applicable"
+        return _with_request_name(
+            {
+                "url": url,
+                "is_medical_document": category != "payment_receipt" and category != "other",
+                "document_type": doc_type,
+                "document_category": category,
+                "invoice_subtype": invoice_subtype,
+                "prescription_subtype": prescription_subtype,
+                "handwritten_percent": content_hw,
+                "computer_generated_percent": content_cg,
+                "completeness_percent": completeness,
+                "parameters": parameters,
+                "missing_parameters": missing_parameters,
+                "message": "",
+            },
+            hint,
+            extract_fields,
+        )
+
     category = str(data.get("document_category", "other"))
     if category not in _VALID_CATEGORIES:
         category = "other"
@@ -2612,6 +2810,7 @@ def _build_public_response(
     rep_params = _normalize_params(
         data.get("report_parameters"), REPORT_PARAM_KEYS, _REPORT_ARRAY_KEYS
     )
+    _normalize_report_fields(rep_params)
     data["report_parameters"] = rep_params
 
     pay_params = _normalize_params(
@@ -2764,11 +2963,21 @@ def _peek_doctor_registration_needs_refine(data: Dict[str, Any]) -> bool:
         return False
     if not data.get("is_medical_document", True):
         return False
+    buckets = []
     rx_raw = data.get("prescription_parameters")
-    if not isinstance(rx_raw, dict):
-        return False
-    reg = _str_val(rx_raw.get("doctor_registration_number"))
-    return not reg or reg.lower() == "present"
+    if isinstance(rx_raw, dict):
+        buckets.append(rx_raw)
+    params_raw = data.get("parameters")
+    if isinstance(params_raw, dict):
+        buckets.append(params_raw)
+    if not buckets:
+        return True
+    for bucket in buckets:
+        reg = _str_val(bucket.get("doctor_registration_number"))
+        name = _str_val(bucket.get("doctor_name"))
+        if (not reg or reg.lower() == "present") or not name:
+            return True
+    return False
 
 
 def _retry_wait_seconds(error: Exception, attempt: int) -> float:
@@ -2866,23 +3075,45 @@ def _call_openai_vision(
     field_list = tuple(extract_fields or ())
     hint_note = ""
     if hint:
-        hint_note = (
-            f" CALLER LABEL: document_category MUST be '{hint}'. "
-            "Do not reclassify away from the caller label."
-        )
+        hint_note = f" This document is a '{hint}'."
     if field_list:
         targets = ", ".join(field_list)
+        date_note = ""
+        if "sample_collection_date" in field_list or "report_date" in field_list:
+            date_note = (
+                " DATE ALIASES: sample_collection_date = Registered On, Sample Collected On, "
+                "Collected On, Received On, Scan Date, Examination Date "
+                "(on radiology/HRCT, Registered On IS sample_collection_date). "
+                "report_date = Reported On, Report Date, Date of Report. Use YYYY-MM-DD."
+            )
+        rx_note = ""
+        if any(
+            key in field_list
+            for key in (
+                "doctor_name",
+                "doctor_registration_number",
+                "doctor_signature",
+                "prescribed_medicines",
+            )
+        ):
+            rx_note = (
+                " RX FOOTER: doctor_name = Prescribed by / (Dr. …) even on a later page; "
+                "doctor_registration_number = Regn no / Reg No / WBMC/MCI (number only); "
+                "doctor_signature = \"present\" if a handwritten signature is visible; "
+                "prescribed_medicines = medicine table rows [{medicine, dosage}]."
+            )
         user_text = (
-            "Classify content type and extract ONLY the requested parameter keys below. "
-            "Put each key in its correct bucket (prescription_parameters / invoice_parameters / "
-            "report_parameters / payment_receipt_parameters). "
+            "Extract ONLY the caller-requested keys into parameters. "
             f"TARGET FIELDS: {targets}. "
-            "Leave every other parameter key as \"\" or []. Do not invent values."
+            "Use \"\" or [] if a value is not printed. Do not invent values."
+            + date_note
+            + rx_note
             + page_note
             + hint_note
         )
         schema = _build_slim_document_schema(field_list)
         max_tokens = _openai_max_tokens_for_request(hint or "", field_list)
+        system_prompt = FIELDS_SYSTEM_PROMPT
     else:
         if hint:
             hint_note = (
@@ -2909,10 +3140,11 @@ def _call_openai_vision(
         )
         schema = DOCUMENT_SCHEMA
         max_tokens = _openai_max_tokens_for_request(hint or "", None)
+        system_prompt = SYSTEM_PROMPT
     return _call_openai_json(
         client,
         model,
-        SYSTEM_PROMPT,
+        system_prompt,
         user_text,
         image_blocks,
         "medical_document_extraction",
@@ -2970,6 +3202,12 @@ def _refine_doctor_registration_stamp(
     _apply_doctor_reg_from_refined(rx, refined)
     _normalize_doctor_registration(rx)
     data["prescription_parameters"] = rx
+    params_raw = data.get("parameters")
+    if isinstance(params_raw, dict):
+        params = dict(params_raw)
+        _apply_doctor_reg_from_refined(params, refined)
+        _normalize_doctor_registration(params)
+        data["parameters"] = params
 
 
 def _refine_invoice_gst_header(
@@ -3136,6 +3374,15 @@ def classify_document_url_openai(
             _apply_category_hint(data, hint)
         else:
             _recover_medical_classification(data)
+
+    if doc.is_pdf:
+        try:
+            pdf_text = extract_pdf_text(doc.raw, max_pages=pdf_vision_max_pages())
+        except Exception:
+            logger.exception("PDF text extract failed for %s", url)
+            pdf_text = ""
+        if pdf_text:
+            _fill_labeled_dates_from_text(data, pdf_text)
 
     refine_ms = 0.0
     if _OPENAI_REFINE_PASSES:
