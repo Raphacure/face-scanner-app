@@ -586,6 +586,8 @@ Optional: payment_time, account_number_masked, ifsc, remarks.
 prescription_subtype: opd | pharmacy | diagnostic | dental | eye_care | uncertain | not_applicable
 Common: patient_*, consultation_date, clinic_hospital_*, doctor_name/qualification/registration_number,
 doctor_signature/stamp, diagnosis, presenting_complaints, line_of_treatment, followup_*.
+doctor_name: from letterhead or Prescribed by. Transliterate regional scripts to English when visible.
+Use "" if the name is not printed or not readable — plain text only, no placeholders.
 - opd/pharmacy: prescribed_medicines[{medicine,dosage}]; advised_tests if labs
 - diagnostic: advised_tests[]; dental: tooth/treatment/procedure; eye: VA/power/glasses
 eye_care / OPD SUMMARY / refraction sheets — extract EVERY visible clinical field:
@@ -618,6 +620,8 @@ Prescribed by / (Dr. Name) / Regn no are often at the bottom of a later page.
 Map visible labels onto the requested keys. Do not invent values.
 Dates as YYYY-MM-DD when possible. Signatures/stamps: "present" if visible but illegible.
 Handwritten vs computer_generated percents must sum to 100.
+doctor_name: transliterate regional-script letterhead names to English when visible; use "" if not found.
+Text fields use "" when absent — never "present" (only doctor_signature / doctor_stamp use "present").
 """
 
 PHARMACY_REGULATORY_SCHEMA: Dict[str, Any] = {
@@ -654,20 +658,19 @@ drug_license_number: every DL/Form 20/21 line; join with "; ".
 DOCTOR_REG_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
+        "doctor_name": {"type": "string"},
         "doctor_registration_number": {"type": "string"},
         "doctor_stamp": {"type": "string"},
     },
-    "required": ["doctor_registration_number", "doctor_stamp"],
+    "required": ["doctor_name", "doctor_registration_number", "doctor_stamp"],
     "additionalProperties": False,
 }
 
-DOCTOR_REG_PROMPT = """Extract doctor_registration_number from the doctor rubber stamp / signature area
-(usually bottom or bottom-right of an OPD / prescription card).
-Labels include: CN No, CN No., CN-, C.N. No, Council No, Reg No, Regd No, RMC, MCI, MMC, HPMC.
-Return the registration code only — e.g. printed/written "CN-2158" → "2158"; "CN No: 12345" → "12345".
+DOCTOR_REG_PROMPT = """Extract doctor_name and doctor_registration_number from prescription letterhead / stamp area.
+doctor_name: full printed name; transliterate regional scripts to English. Use "" if not found.
+doctor_registration_number: from stamp/signature area (CN No, Reg No, Regd No, RMC, MCI, MMC, HPMC) — number only.
 Do NOT return CR No, Patient Registration, Token No, Room No, Mobile, Fee amounts, or barcodes.
-doctor_stamp: "present" if a stamp/seal is visible (even if text is faint), else "".
-Use "" for doctor_registration_number only when no CN/Reg number appears near the stamp/signature."""
+doctor_stamp: "present" if a stamp/seal is visible (even if text is faint), else ""."""
 
 DOCUMENT_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -884,7 +887,10 @@ def _openai_max_tokens_for_request(
 def _fields_need_doctor_reg_refine(extract_fields: Optional[Sequence[str]]) -> bool:
     if not extract_fields:
         return True
-    return "doctor_registration_number" in extract_fields or "doctor_stamp" in extract_fields
+    return any(
+        key in extract_fields
+        for key in ("doctor_registration_number", "doctor_stamp", "doctor_name")
+    )
 
 
 def _fields_need_gst_refine(extract_fields: Optional[Sequence[str]]) -> bool:
@@ -961,12 +967,31 @@ def _normalize_params(
     return result
 
 
+def _is_usable_doctor_name(raw: Any) -> bool:
+    """True only for a real printed doctor name — placeholders become ""."""
+    name = _str_val(raw)
+    if not name:
+        return False
+    low = name.lower()
+    if low == "present" or low in _PLACEHOLDER_VALUES:
+        return False
+    if "..." in name or "…" in name:
+        return False
+    if re.fullmatch(r"dr\.?", name, flags=re.I):
+        return False
+    core = re.sub(r"^dr\.?\s*", "", name, flags=re.I).strip(" .")
+    if len(core) < 3 or not re.search(r"[A-Za-z\u0900-\u0dff]", core):
+        return False
+    return True
+
+
 def _normalize_doctor_name_value(params: Dict[str, Any]) -> None:
     """Strip Prescribed by / parentheses wrappers from a printed doctor name."""
     if "doctor_name" not in params:
         return
     name = _str_val(params.get("doctor_name"))
-    if not name or name.lower() == "present":
+    if not _is_usable_doctor_name(name):
+        params["doctor_name"] = ""
         return
     name = re.sub(r"^(?:prescribed\s*by\s*:?\s*)", "", name, flags=re.I)
     name = name.strip("() ").strip()
@@ -2975,7 +3000,7 @@ def _peek_doctor_registration_needs_refine(data: Dict[str, Any]) -> bool:
     for bucket in buckets:
         reg = _str_val(bucket.get("doctor_registration_number"))
         name = _str_val(bucket.get("doctor_name"))
-        if (not reg or reg.lower() == "present") or not name:
+        if (not reg or reg.lower() == "present") or not _is_usable_doctor_name(name):
             return True
     return False
 
@@ -3097,7 +3122,7 @@ def _call_openai_vision(
             )
         ):
             rx_note = (
-                " RX FOOTER: doctor_name = Prescribed by / (Dr. …) even on a later page; "
+                " RX FOOTER: doctor_name = full printed name or \"\"; "
                 "doctor_registration_number = Regn no / Reg No / WBMC/MCI (number only); "
                 "doctor_signature = \"present\" if a handwritten signature is visible; "
                 "prescribed_medicines = medicine table rows [{medicine, dosage}]."
@@ -3160,6 +3185,11 @@ def _call_openai_vision(
 def _apply_doctor_reg_from_refined(
     rx: Dict[str, Any], refined: Dict[str, Any]
 ) -> None:
+    name = _str_val(refined.get("doctor_name"))
+    if _is_usable_doctor_name(name):
+        existing = _str_val(rx.get("doctor_name"))
+        if not _is_usable_doctor_name(existing):
+            rx["doctor_name"] = name
     reg = _str_val(refined.get("doctor_registration_number"))
     if reg and reg.lower() != "present" and not _str_val(rx.get("doctor_registration_number")):
         rx["doctor_registration_number"] = reg
@@ -3178,8 +3208,16 @@ def _refine_doctor_registration_stamp(
     data: Dict[str, Any],
     doc: DocumentPages,
 ) -> None:
-    """Vision pass on bottom/stamp crops when doctor_registration_number is still empty."""
-    crop_blocks = build_stamp_blocks_from_document(doc.raw, doc=doc)
+    """Vision pass on header/stamp crops when doctor name or registration is still empty."""
+    stamp_blocks = build_stamp_blocks_from_document(doc.raw, doc=doc)
+    header_blocks = build_gst_header_blocks_from_document(doc.raw, doc=doc)
+    crop_blocks: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for block in header_blocks + stamp_blocks:
+        url = str((block.get("image_url") or {}).get("url") or "")
+        if url and url not in seen:
+            seen.add(url)
+            crop_blocks.append(block)
     if not crop_blocks:
         return
 
@@ -3188,14 +3226,14 @@ def _refine_doctor_registration_stamp(
         model,
         DOCTOR_REG_PROMPT,
         (
-            "Zoomed bottom / signature-zone crops of a prescription or OPD card. "
-            "Find CN No / Reg No on or under the doctor stamp or signature. "
-            "Ignore CR No / Token / Mobile."
+            "Zoomed letterhead and bottom / signature-zone crops of a prescription or OPD card. "
+            "Find doctor_name on the letterhead (transliterate regional scripts to English) and "
+            "CN No / Reg No on or under the doctor stamp or signature. Ignore CR No / Token / Mobile."
         ),
         crop_blocks,
         "doctor_registration_stamp_extraction",
         DOCTOR_REG_SCHEMA,
-        250,
+        350,
     )
     rx_raw = data.get("prescription_parameters")
     rx: Dict[str, Any] = dict(rx_raw) if isinstance(rx_raw, dict) else {}
@@ -3428,3 +3466,68 @@ def classify_document_url_openai(
         total_ms,
     )
     return result
+
+
+def _patient_match_key(raw: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", _str_val(raw).lower())
+
+
+def _refresh_prescription_result_completeness(result: Dict[str, Any]) -> None:
+    """Recompute completeness after post-batch doctor_name enrichment."""
+    params = result.get("parameters")
+    if not isinstance(params, dict):
+        return
+    fields = result.get("fields")
+    if fields:
+        required = tuple(fields)
+        extra: Tuple[Any, ...] = ()
+    else:
+        subtype = str(result.get("prescription_subtype") or "opd")
+        required = PRESCRIPTION_SUBTYPE_REQUIRED.get(subtype, PRESCRIPTION_REQUIRED)
+        extra = _prescription_subtype_extra_checks(subtype, params)
+    completeness, missing = _completeness(params, required, extra)
+    result["completeness_percent"] = completeness
+    result["missing_parameters"] = missing
+
+
+def enrich_claim_batch_doctor_names(results: List[Dict[str, Any]]) -> None:
+    """Fill weak prescription doctor_name from sibling claim documents (e.g. pharmacy invoice)."""
+    by_patient: Dict[str, str] = {}
+    fallback_names: List[str] = []
+
+    for result in results:
+        if result.get("error"):
+            continue
+        params = result.get("parameters")
+        if not isinstance(params, dict):
+            continue
+        name = _str_val(params.get("doctor_name"))
+        if not _is_usable_doctor_name(name):
+            continue
+        patient_key = _patient_match_key(params.get("patient_name"))
+        if patient_key:
+            by_patient.setdefault(patient_key, name)
+        else:
+            fallback_names.append(name)
+
+    if not by_patient and not fallback_names:
+        return
+
+    for result in results:
+        if result.get("error") or result.get("document_category") != "prescription":
+            continue
+        params = result.get("parameters")
+        if not isinstance(params, dict):
+            continue
+        if _is_usable_doctor_name(params.get("doctor_name")):
+            continue
+        patient_key = _patient_match_key(params.get("patient_name"))
+        candidate = by_patient.get(patient_key, "")
+        if not candidate and len(fallback_names) == 1:
+            candidate = fallback_names[0]
+        if not candidate:
+            continue
+        params["doctor_name"] = candidate
+        _normalize_doctor_name_value(params)
+        if _is_usable_doctor_name(params.get("doctor_name")):
+            _refresh_prescription_result_completeness(result)

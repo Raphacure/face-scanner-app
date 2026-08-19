@@ -785,7 +785,8 @@ def merge_textract_into_openai_data(
         return
 
     def _blank(val: Any) -> bool:
-        return not str(val or "").strip()
+        s = str(val or "").strip()
+        return not s or s.lower() == "present"
 
     inv_raw = data.get("invoice_parameters")
     inv: Dict[str, Any] = dict(inv_raw) if isinstance(inv_raw, dict) else {}
