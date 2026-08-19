@@ -785,7 +785,8 @@ def merge_textract_into_openai_data(
         return
 
     def _blank(val: Any) -> bool:
-        return not str(val or "").strip()
+        s = str(val or "").strip()
+        return not s or s.lower() == "present"
 
     inv_raw = data.get("invoice_parameters")
     inv: Dict[str, Any] = dict(inv_raw) if isinstance(inv_raw, dict) else {}
@@ -886,6 +887,15 @@ def merge_textract_into_openai_data(
         data["report_parameters"] = rep
     if pay:
         data["payment_receipt_parameters"] = pay
+
+    params_raw = data.get("parameters")
+    params: Dict[str, Any] = dict(params_raw) if isinstance(params_raw, dict) else {}
+    for key, raw in ocr.items():
+        ocr_val = str(raw or "").strip()
+        if ocr_val and _blank(params.get(key)):
+            params[key] = ocr_val
+    if params:
+        data["parameters"] = params
 
     category = str(data.get("document_category", "other"))
     # Strong payment proof only — never flip on a lone email-like "@" token.
