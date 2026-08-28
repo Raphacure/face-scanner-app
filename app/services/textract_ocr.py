@@ -78,8 +78,12 @@ _FACILITY_LINE_RE = re.compile(
 )
 _APPT_DATE_RE = re.compile(
     r"(?:Appt\.?\s*Dt|Note\s*Dt|Visit\s*Date|Date)\s*[:\-]?\s*"
-    r"([0-9]{1,2}[\s/\-][A-Za-z]{3,9}'?\s*\d{2,4}|[0-9]{1,2}[/\-][0-9]{1,2}[/\-][0-9]{2,4})",
+    r"([0-9]{1,2}[\s/|.\-][A-Za-z]{3,9}'?\s*\d{2,4}|[0-9]{1,2}[/|.\-][0-9]{1,2}[/|.\-][0-9]{2,4})",
     re.IGNORECASE,
+)
+_STANDALONE_RX_DATE_RE = re.compile(
+    r"(?:^|\n)\s*(\d{1,2}[/|.\-]\d{1,2}[/|.\-]\d{2,4})\s*(?:\n|$)",
+    re.MULTILINE,
 )
 _SYSTEMIC_RE = re.compile(
     r"Systemic\s*History\s*:?\s*(.+?)(?:\n\s*Allergies|\n\s*GLASSES|\n\s*REFRACTION|\Z)",
@@ -331,7 +335,11 @@ def _parse_demographics_from_lines(lines: List[str]) -> Dict[str, str]:
 
     dm = _APPT_DATE_RE.search(text)
     if dm:
-        out["consultation_date"] = re.sub(r"\s+", " ", dm.group(1)).strip()
+        out["consultation_date"] = re.sub(r"\s+", " ", dm.group(1)).strip().replace("|", "/")
+    if not out["consultation_date"]:
+        sm = _STANDALONE_RX_DATE_RE.search(text)
+        if sm:
+            out["consultation_date"] = sm.group(1).strip().replace("|", "/")
 
     systemic = _SYSTEMIC_RE.search(text)
     if systemic:
