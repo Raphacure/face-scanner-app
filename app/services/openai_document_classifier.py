@@ -777,6 +777,14 @@ def normalize_document_name_hint(raw: Any) -> str:
     return _DOCUMENT_NAME_ALIASES.get(text, "")
 
 
+def request_name_for_response(category_hint: Optional[str]) -> str:
+    """Echo label for CRM — known types normalized, unknown (e.g. other) passed through."""
+    hint = normalize_document_name_hint(category_hint)
+    if hint:
+        return hint
+    return str(category_hint or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
 _FIELD_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 
 
@@ -2686,6 +2694,7 @@ def _build_public_response(
     extract_fields: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     hint = normalize_document_name_hint(category_hint)
+    response_name = request_name_for_response(category_hint)
     if hint:
         # CRM label wins — skip auto recovery that flips invoice ↔ payment ↔ Rx.
         _apply_category_hint(data, hint)
@@ -2737,7 +2746,7 @@ def _build_public_response(
                 "missing_parameters": missing_parameters,
                 "message": "",
             },
-            hint,
+            response_name,
             extract_fields,
         )
 
@@ -2809,7 +2818,7 @@ def _build_public_response(
                 "missing_parameters": ["not_a_medical_document"],
                 "message": non_medical_reason,
             },
-            hint,
+            response_name,
             extract_fields,
         )
 
@@ -2876,7 +2885,7 @@ def _build_public_response(
                 "missing_parameters": missing_parameters,
                 "message": "",
             },
-            hint,
+            response_name,
             extract_fields,
         )
 
@@ -2949,7 +2958,7 @@ def _build_public_response(
             "missing_parameters": missing_parameters,
             "message": "",
         },
-        hint,
+        response_name,
         extract_fields,
     )
 
