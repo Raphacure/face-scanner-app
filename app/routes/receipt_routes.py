@@ -25,7 +25,7 @@ class DocumentClassifyItem(BaseModel):
     name: str = Field(
         ...,
         min_length=1,
-        description="invoice | prescription | report | payment_receipt",
+        description="CRM document label (invoice, prescription, report, payment_receipt, other, etc.).",
     )
     fields: Optional[List[str]] = Field(
         default=None,
@@ -39,13 +39,12 @@ class DocumentClassifyItem(BaseModel):
     @field_validator("name")
     @classmethod
     def _validate_name(cls, value: str) -> str:
-        normalized = normalize_document_name_hint(value)
-        if not normalized:
-            raise ValueError(
-                "name must be invoice, prescription, report, or payment_receipt "
-                "(aliases: bill, rx, opd, lab, payment, upi)"
-            )
-        return normalized
+        text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if not text:
+            raise ValueError("name is required")
+        # Map known aliases; pass through anything else (e.g. other) — CRM validates.
+        mapped = normalize_document_name_hint(value)
+        return mapped if mapped else text
 
     @field_validator("fields")
     @classmethod
