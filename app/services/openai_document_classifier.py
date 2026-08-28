@@ -321,6 +321,9 @@ def _parameters_from_extraction(
     _normalize_report_fields(params)
     _normalize_doctor_name_value(params)
     _normalize_doctor_registration(params)
+    date_val = _str_val(params.get("consultation_date"))
+    if date_val:
+        params["consultation_date"] = _normalize_to_iso_date(date_val)
     return params
 
 
@@ -592,7 +595,9 @@ Use "" if the name is not printed or not readable — plain text only, no placeh
 - diagnostic: advised_tests[]; dental: tooth/treatment/procedure; eye: VA/power/glasses
 eye_care / OPD SUMMARY / refraction sheets — extract EVERY visible clinical field:
 - patient_name, patient_age, patient_gender from Age/Sex (e.g. "42 years 0 months /Female")
-- consultation_date from Appt Dt / Note Dt; clinic_hospital_name from Facility; doctor_name from Doctor
+- consultation_date from Appt Dt / Note Dt / Visit Date / Date label, OR a standalone
+  handwritten date in the top-left header (e.g. 6/8/26, 06-08-2026) even without a label;
+  normalize 2-digit years to 20xx (6/8/26 → 2026-08-06)
 - diagnosis: Systemic History / Visit reason when Chief Complaints is None/Nil
 - presenting_complaints: Chief Complaints (use "" if literally None/Nil)
 - visual_acuity_details: all VA + IOP lines
@@ -1095,14 +1100,14 @@ _NAMED_DATE_RE = re.compile(
     r"^(\d{1,2})[/\-.\s]([A-Za-z]{3,9})[/\-.\s](\d{2,4})$"
 )
 _YMD_DATE_RE = re.compile(r"^(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})$")
-_DMY_DATE_RE = re.compile(r"^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})$")
+_DMY_DATE_RE = re.compile(r"^(\d{1,2})[/|.\-](\d{1,2})[/|.\-](\d{2,4})$")
 _DATE_VALUE_RE = (
     r"(\d{1,2}[/\-.\s](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*"
     r"[/\-.\s]\d{2,4}"
     r"(?:\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AaPp]\.?[Mm]\.?)?)?"
     r"|\d{4}[/\-.]\d{1,2}[/\-.]\d{1,2}"
     r"(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?"
-    r"|\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}"
+    r"|\d{1,2}[/|.\-]\d{1,2}[/|.\-]\d{2,4}"
     r"(?:\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AaPp]\.?[Mm]\.?)?)?)"
 )
 _SAMPLE_COLLECTION_LABEL_RE = re.compile(
@@ -1144,6 +1149,22 @@ _REPORT_DATE_LABEL_RE = re.compile(
     + _DATE_VALUE_RE,
     re.IGNORECASE,
 )
+_CONSULTATION_DATE_LABEL_RE = re.compile(
+    r"(?:"
+    r"consultation\s*date"
+    r"|visit\s*date"
+    r"|appt\.?\s*dt"
+    r"|note\s*dt"
+    r"|date\s*of\s*visit"
+    r"|^date"
+    r")\s*[:\-]?\s*"
+    + _DATE_VALUE_RE,
+    re.IGNORECASE | re.MULTILINE,
+)
+_STANDALONE_RX_DATE_RE = re.compile(
+    r"(?:^|\n)\s*(\d{1,2}[/|.\-]\d{1,2}[/|.\-]\d{2,4})\s*(?:\n|$)",
+    re.MULTILINE,
+)
 
 
 def _collapse_ws(raw: str) -> str:
@@ -1154,6 +1175,7 @@ def _normalize_to_iso_date(raw: Any) -> str:
     """Normalize printed Indian dates to YYYY-MM-DD; keep original if unparseable."""
     original = _str_val(raw)
     text = _TIME_SUFFIX_RE.sub("", _collapse_ws(original)).strip(" .,;")
+    text = text.replace("|", "/")
     if not text:
         return ""
 
@@ -1192,14 +1214,33 @@ def _extract_labeled_date(text: str, pattern: re.Pattern[str]) -> str:
     return _normalize_to_iso_date(match.group(1))
 
 
+def _extract_consultation_date_from_text(text: str) -> str:
+    """Pull consultation/visit date from labeled or standalone Rx header text."""
+    if not text or not text.strip():
+        return ""
+    labeled = _extract_labeled_date(text, _CONSULTATION_DATE_LABEL_RE)
+    if labeled:
+        return labeled
+    standalone = _STANDALONE_RX_DATE_RE.search(text)
+    if standalone:
+        return _normalize_to_iso_date(standalone.group(1))
+    for match in re.finditer(
+        r"\b(\d{1,2}[/|.\-]\d{1,2}[/|.\-]\d{2,4})\b",
+        text,
+    ):
+        normalized = _normalize_to_iso_date(match.group(1))
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+            return normalized
+    return ""
+
+
 def _fill_labeled_dates_from_text(data: Dict[str, Any], text: str) -> None:
-    """Fill empty sample_collection_date / report_date from labeled PDF/OCR text."""
+    """Fill empty sample/report/consultation dates from PDF/OCR text."""
     if not text or not text.strip():
         return
     sample = _extract_labeled_date(text, _SAMPLE_COLLECTION_LABEL_RE)
     report = _extract_labeled_date(text, _REPORT_DATE_LABEL_RE)
-    if not sample and not report:
-        return
+    consultation = _extract_consultation_date_from_text(text)
 
     assignments = (
         ("parameters", "sample_collection_date", sample),
@@ -1207,6 +1248,8 @@ def _fill_labeled_dates_from_text(data: Dict[str, Any], text: str) -> None:
         ("invoice_parameters", "sample_collection_date", sample),
         ("parameters", "report_date", report),
         ("report_parameters", "report_date", report),
+        ("parameters", "consultation_date", consultation),
+        ("prescription_parameters", "consultation_date", consultation),
     )
     for bucket_key, field, value in assignments:
         if not value:
@@ -2048,6 +2091,9 @@ def _normalize_prescription_fields(params: Dict[str, Any]) -> None:
         params["patient_gender"] = "F"
     elif gender in ("male", "m"):
         params["patient_gender"] = "M"
+    date_val = _str_val(params.get("consultation_date"))
+    if date_val:
+        params["consultation_date"] = _normalize_to_iso_date(date_val)
 
 
 def _infer_prescription_subtype(params: Dict[str, Any], raw_subtype: str) -> str:
