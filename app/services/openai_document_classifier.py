@@ -571,6 +571,9 @@ INVOICE: patient_*, invoice_number/date, provider_*, doctor_name, total_amount (
 payment_mode, transaction_reference, authorized_stamp/signature.
 MUST extract gst_number (15-char GSTIN only, no label) from top header/top-right if printed.
 GSTIN may appear as **GSTIN:** **02AAHCHxxxxxZx** — strip * and return the code. Never FSSAI/CST/RST.
+Pharmacy cash memo / chemist bill: patient_name = handwritten value after "Prescribed for"
+(not the doctor). doctor_name = value after "By Dr" / "Dr.". Do not leave patient_name empty
+when "Prescribed for" has a handwritten name.
 Pharmacy: drug_license_number (all DL lines, join "; "); medicine_details[] "name | Qty | Rate | Batch | Exp".
 OPD: consultation_charges, registration_charges, service_details[].
 Diagnostic: sample_collection_date (Registered On / Collected On / Received On), test_details[] "Test — Rs amt".
@@ -626,6 +629,8 @@ Map visible labels onto the requested keys. Do not invent values.
 Dates as YYYY-MM-DD when possible. Signatures/stamps: "present" if visible but illegible.
 Handwritten vs computer_generated percents must sum to 100.
 doctor_name: transliterate regional-script letterhead names to English when visible; use "" if not found.
+Pharmacy / cash memo labels: patient_name = "Prescribed for" / Patient / Name; doctor_name = "By Dr" / Doctor.
+Do not confuse "Prescribed for" (patient) with "By Dr" (doctor). Use "" only when truly absent.
 Text fields use "" when absent — never "present" (only doctor_signature / doctor_stamp use "present").
 """
 
@@ -3182,12 +3187,20 @@ def _call_openai_vision(
                 "doctor_signature = \"present\" if a handwritten signature is visible; "
                 "prescribed_medicines = medicine table rows [{medicine, dosage}]."
             )
+        inv_note = ""
+        if "patient_name" in field_list or "doctor_name" in field_list:
+            inv_note = (
+                " CASH MEMO / PHARMACY: patient_name = handwritten name after "
+                "\"Prescribed for\" (or Patient / Name); doctor_name = after \"By Dr\" / Doctor. "
+                "These are different fields — fill both when both lines have handwriting."
+            )
         user_text = (
             "Extract ONLY the caller-requested keys into parameters. "
             f"TARGET FIELDS: {targets}. "
             "Use \"\" or [] if a value is not printed. Do not invent values."
             + date_note
             + rx_note
+            + inv_note
             + page_note
             + hint_note
         )

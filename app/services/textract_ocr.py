@@ -72,6 +72,17 @@ _DOCTOR_LINE_RE = re.compile(
     r"(?:^|\n)\s*Doctor\s*[:\-]?\s*(Dr\.?\s*[A-Za-z][A-Za-z.\s]{2,60})",
     re.IGNORECASE,
 )
+# Pharmacy cash memo: "Prescribed for:...... Paksh Chaudhary" / "By Dr....... Kailash"
+_PRESCRIBED_FOR_RE = re.compile(
+    r"Prescribed\s*for\s*[:.\-\s]*([A-Za-z][A-Za-z.'\s]{1,60}?)"
+    r"(?=\s*(?:By\s*Dr|Doctor|Date|No\.?\b|Particular|$|\n))",
+    re.IGNORECASE,
+)
+_BY_DR_RE = re.compile(
+    r"By\s*Dr\.?\s*[:.\-\s]*([A-Za-z][A-Za-z.'\s]{1,60}?)"
+    r"(?=\s*(?:Date|No\.?\b|Particular|Prescribed|Age|Sex|$|\n))",
+    re.IGNORECASE,
+)
 _FACILITY_LINE_RE = re.compile(
     r"(?:^|\n)\s*Facility\s*[:\-]?\s*([^\n]{3,80})",
     re.IGNORECASE,
@@ -279,17 +290,24 @@ def _value_after_label(lines: List[str], labels: Sequence[str]) -> str:
     label_set = {lab.lower() for lab in labels}
     for idx, line in enumerate(lines):
         raw = line.strip()
-        low = raw.lower().rstrip(":")
+        low = re.sub(r"[:.\-\s]+$", "", raw.lower())
         if low in label_set:
             if idx + 1 < len(lines):
-                nxt = lines[idx + 1].strip()
-                if nxt and nxt.lower().rstrip(":") not in label_set:
+                nxt = lines[idx + 1].strip().lstrip(".:- ")
+                if nxt and re.sub(r"[:.\-\s]+$", "", nxt.lower()) not in label_set:
                     return nxt
             continue
         for lab in labels:
-            prefix = lab.lower() + ":"
-            if low.startswith(prefix):
-                return raw.split(":", 1)[1].strip()
+            lab_low = lab.lower()
+            if low.startswith(lab_low):
+                # Same-line value after "Prescribed for:...... Name" / "By Dr....... Name"
+                rest = raw[len(lab) :].lstrip(" :.-")
+                if rest:
+                    return rest
+                if idx + 1 < len(lines):
+                    nxt = lines[idx + 1].strip().lstrip(".:- ")
+                    if nxt and re.sub(r"[:.\-\s]+$", "", nxt.lower()) not in label_set:
+                        return nxt
     return ""
 
 
@@ -315,14 +333,22 @@ def _parse_demographics_from_lines(lines: List[str]) -> Dict[str, str]:
             "F" if gender.startswith("F") else "M" if gender.startswith("M") else gender
         )
 
-    patient = _value_after_label(lines, ["Patient", "Patient Name", "Patient's Name"])
-    if patient:
+    patient = _value_after_label(
+        lines,
+        ["Patient", "Patient Name", "Patient's Name", "Prescribed for", "Prescribed For"],
+    )
+    if not patient:
+        pm = _PRESCRIBED_FOR_RE.search(text)
+        patient = pm.group(1).strip(" .") if pm else ""
+    if patient and len(patient) > 2:
         out["patient_name"] = patient
 
-    doctor = _value_after_label(lines, ["Doctor", "Consultant", "Unit Consultants"])
+    doctor = _value_after_label(
+        lines, ["Doctor", "Consultant", "Unit Consultants", "By Dr", "By Dr."]
+    )
     if not doctor:
-        dm = _DOCTOR_LINE_RE.search(text)
-        doctor = dm.group(1).strip() if dm else ""
+        dm = _BY_DR_RE.search(text) or _DOCTOR_LINE_RE.search(text)
+        doctor = dm.group(1).strip(" .") if dm else ""
     if doctor and len(doctor) > 3:
         out["doctor_name"] = doctor
 
