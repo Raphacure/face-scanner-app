@@ -569,11 +569,16 @@ invoice_subtype: pharmacy | diagnostic | opd_consultation | dental | eye_care | 
 
 INVOICE: patient_*, invoice_number/date, provider_*, doctor_name, total_amount (digits only, primary total),
 payment_mode, transaction_reference, authorized_stamp/signature.
+invoice_number: Bill No / Invoice No / Receipt No / Inv No / Memo No, OR regional labels
+(बिल नं / रसीद नं / पावती नं / क्रमांक / नं.). Hospital/OPD fee receipts often print only a
+serial number in the top-right / header with no English label — that printed serial IS
+invoice_number. Do not leave invoice_number empty when such a header serial is visible.
 MUST extract gst_number (15-char GSTIN only, no label) from top header/top-right if printed.
 GSTIN may appear as **GSTIN:** **02AAHCHxxxxxZx** — strip * and return the code. Never FSSAI/CST/RST.
 Pharmacy cash memo / chemist bill: patient_name = handwritten value after "Prescribed for"
 (not the doctor). doctor_name = value after "By Dr" / "Dr.". Do not leave patient_name empty
-when "Prescribed for" has a handwritten name.
+when "Prescribed for" has a handwritten name. Regional patient labels (नाव / Name) also map to
+patient_name; date labels (दिनांक / Date) to invoice_date.
 Pharmacy: drug_license_number (all DL lines, join "; "); medicine_details[] "name | Qty | Rate | Batch | Exp".
 OPD: consultation_charges, registration_charges, service_details[].
 Diagnostic: sample_collection_date (Registered On / Collected On / Received On), test_details[] "Test — Rs amt".
@@ -594,6 +599,9 @@ Common: patient_*, consultation_date, clinic_hospital_*, doctor_name/qualificati
 doctor_signature/stamp, diagnosis, presenting_complaints, line_of_treatment, followup_*.
 doctor_name: from letterhead or Prescribed by. Transliterate regional scripts to English when visible.
 Use "" if the name is not printed or not readable — plain text only, no placeholders.
+clinic_hospital_name: from letterhead logo / hospital title (top of Rx). If printed only in a
+regional script, transliterate to English. Prefer English brand/logo text when both are present.
+Never leave clinic_hospital_name empty when a hospital/clinic name is printed on the letterhead.
 - opd/pharmacy: prescribed_medicines[{medicine,dosage}]; advised_tests if labs
 - diagnostic: advised_tests[]; dental: tooth/treatment/procedure; eye: VA/power/glasses
 eye_care / OPD SUMMARY / refraction sheets — extract EVERY visible clinical field:
@@ -616,9 +624,14 @@ doctor_stamp / doctor_signature: "present" if visible but illegible; still try t
 REPORT: specific test_names (not section titles), test_results, dates, pathologist_*, laboratory_*.
 sample_collection_date aliases (MUST fill when printed): Registered On, Sample Collected On,
 Collected On, Collection Date, Received On, Sample Received, Drawn On, Scan Date, Examination Date.
-Radiology/HRCT/CT/MRI/X-ray: no blood/urine sample — Registered On / Scan Date IS sample_collection_date.
-report_date aliases: Reported On, Report Date, Date of Report, Released On.
+Radiology/HRCT/CT/MRI/X-ray/CBCT/OPG: no blood/urine sample — Registered On / Scan Date / Examination
+Date, OR an unlabeled printed date at the top of the report page, IS sample_collection_date AND
+usually report_date when no separate Reported On line exists.
+report_date aliases: Reported On, Report Date, Date of Report, Released On, Verified On,
+OR the top-of-page printed study/report date when unlabeled (common on CBCT/OPG/dental radiology).
+Do NOT use Date of Birth as report_date.
 Return dates as YYYY-MM-DD. Never leave sample_collection_date empty when Registered On is printed.
+Never leave report_date empty when a report/study date is printed on the page.
 """
 
 FIELDS_SYSTEM_PROMPT = """Indian medical claims OCR. Fill JSON; use "" / [] if a value is not printed.
@@ -628,8 +641,13 @@ Prescribed by / (Dr. Name) / Regn no are often at the bottom of a later page.
 Map visible labels onto the requested keys. Do not invent values.
 Dates as YYYY-MM-DD when possible. Signatures/stamps: "present" if visible but illegible.
 Handwritten vs computer_generated percents must sum to 100.
-doctor_name: transliterate regional-script letterhead names to English when visible; use "" if not found.
-Pharmacy / cash memo labels: patient_name = "Prescribed for" / Patient / Name; doctor_name = "By Dr" / Doctor.
+doctor_name / clinic_hospital_name: read letterhead (top of page). If only a regional script is
+printed, transliterate to English. Prefer English logo/brand text when both exist. Use "" only if
+truly not printed — never skip because the letterhead is non-Latin.
+invoice_number: Bill/Invoice/Receipt/Inv/Memo No, regional बिल/रसीद/पावती/क्रमांक labels, OR an
+unlabeled printed serial in the receipt header/top-right (common on OPD fee forms). That serial
+is invoice_number — do not leave it empty when visible.
+Pharmacy / cash memo labels: patient_name = "Prescribed for" / Patient / Name / नाव; doctor_name = "By Dr" / Doctor.
 Do not confuse "Prescribed for" (patient) with "By Dr" (doctor). Use "" only when truly absent.
 Text fields use "" when absent — never "present" (only doctor_signature / doctor_stamp use "present").
 """
@@ -669,15 +687,23 @@ DOCTOR_REG_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "doctor_name": {"type": "string"},
+        "clinic_hospital_name": {"type": "string"},
         "doctor_registration_number": {"type": "string"},
         "doctor_stamp": {"type": "string"},
     },
-    "required": ["doctor_name", "doctor_registration_number", "doctor_stamp"],
+    "required": [
+        "doctor_name",
+        "clinic_hospital_name",
+        "doctor_registration_number",
+        "doctor_stamp",
+    ],
     "additionalProperties": False,
 }
 
-DOCTOR_REG_PROMPT = """Extract doctor_name and doctor_registration_number from prescription letterhead / stamp area.
+DOCTOR_REG_PROMPT = """Extract letterhead doctor_name, clinic_hospital_name, and doctor_registration_number.
 doctor_name: full printed name; transliterate regional scripts to English. Use "" if not found.
+clinic_hospital_name: hospital/clinic title on letterhead or logo; transliterate regional scripts to
+English (prefer English brand text when printed). Use "" if not found.
 doctor_registration_number: from stamp/signature area (CN No, Reg No, Regd No, RMC, MCI, MMC, HPMC) — number only.
 Do NOT return CR No, Patient Registration, Token No, Room No, Mobile, Fee amounts, or barcodes.
 doctor_stamp: "present" if a stamp/seal is visible (even if text is faint), else ""."""
@@ -907,7 +933,12 @@ def _fields_need_doctor_reg_refine(extract_fields: Optional[Sequence[str]]) -> b
         return True
     return any(
         key in extract_fields
-        for key in ("doctor_registration_number", "doctor_stamp", "doctor_name")
+        for key in (
+            "doctor_registration_number",
+            "doctor_stamp",
+            "doctor_name",
+            "clinic_hospital_name",
+        )
     )
 
 
@@ -1170,6 +1201,14 @@ _STANDALONE_RX_DATE_RE = re.compile(
     r"(?:^|\n)\s*(\d{1,2}[/|.\-]\d{1,2}[/|.\-]\d{2,4})\s*(?:\n|$)",
     re.MULTILINE,
 )
+_STANDALONE_ISO_DATE_RE = re.compile(
+    r"(?:^|\n)\s*(\d{4}-\d{2}-\d{2})\b",
+    re.MULTILINE,
+)
+_DOB_CONTEXT_RE = re.compile(
+    r"(?:date\s*of\s*birth|d\.?\s*o\.?\s*b\.?|\bdob\b|born\s*on)\s*[:\-]?\s*$",
+    re.IGNORECASE,
+)
 
 
 def _collapse_ws(raw: str) -> str:
@@ -1219,6 +1258,35 @@ def _extract_labeled_date(text: str, pattern: re.Pattern[str]) -> str:
     return _normalize_to_iso_date(match.group(1))
 
 
+def _preceding_is_dob(text: str, start: int) -> bool:
+    prev = text[max(0, start - 48) : start]
+    return bool(_DOB_CONTEXT_RE.search(prev))
+
+
+def _extract_header_document_date(text: str) -> str:
+    """First printed page/header date (ISO or DMY), skipping Date of Birth."""
+    if not text or not text.strip():
+        return ""
+    head = text[:1500]
+    for pattern in (_STANDALONE_ISO_DATE_RE, _STANDALONE_RX_DATE_RE):
+        for match in pattern.finditer(head):
+            if _preceding_is_dob(head, match.start()):
+                continue
+            normalized = _normalize_to_iso_date(match.group(1))
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+                return normalized
+    for match in re.finditer(
+        r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}[/|.\-]\d{1,2}[/|.\-]\d{2,4})\b",
+        head,
+    ):
+        if _preceding_is_dob(head, match.start()):
+            continue
+        normalized = _normalize_to_iso_date(match.group(1))
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+            return normalized
+    return ""
+
+
 def _extract_consultation_date_from_text(text: str) -> str:
     """Pull consultation/visit date from labeled or standalone Rx header text."""
     if not text or not text.strip():
@@ -1226,16 +1294,9 @@ def _extract_consultation_date_from_text(text: str) -> str:
     labeled = _extract_labeled_date(text, _CONSULTATION_DATE_LABEL_RE)
     if labeled:
         return labeled
-    standalone = _STANDALONE_RX_DATE_RE.search(text)
-    if standalone:
-        return _normalize_to_iso_date(standalone.group(1))
-    for match in re.finditer(
-        r"\b(\d{1,2}[/|.\-]\d{1,2}[/|.\-]\d{2,4})\b",
-        text,
-    ):
-        normalized = _normalize_to_iso_date(match.group(1))
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
-            return normalized
+    header = _extract_header_document_date(text)
+    if header:
+        return header
     return ""
 
 
@@ -1246,6 +1307,14 @@ def _fill_labeled_dates_from_text(data: Dict[str, Any], text: str) -> None:
     sample = _extract_labeled_date(text, _SAMPLE_COLLECTION_LABEL_RE)
     report = _extract_labeled_date(text, _REPORT_DATE_LABEL_RE)
     consultation = _extract_consultation_date_from_text(text)
+    header = _extract_header_document_date(text)
+    # CBCT/OPG/radiology often print only an unlabeled top date (e.g. 2026-08-16).
+    if not report:
+        report = header
+    if not sample:
+        sample = header
+    if not consultation:
+        consultation = header
 
     assignments = (
         ("parameters", "sample_collection_date", sample),
@@ -3043,7 +3112,7 @@ def _peek_invoice_gst_needs_refine(data: Dict[str, Any]) -> bool:
 
 
 def _peek_doctor_registration_needs_refine(data: Dict[str, Any]) -> bool:
-    """Stamp-zone pass when Rx has empty/illegible doctor registration (e.g. CN No)."""
+    """Letterhead/stamp pass when Rx doctor name, hospital, or registration is still empty."""
     if str(data.get("document_category")) != "prescription":
         return False
     if not data.get("is_medical_document", True):
@@ -3060,7 +3129,13 @@ def _peek_doctor_registration_needs_refine(data: Dict[str, Any]) -> bool:
     for bucket in buckets:
         reg = _str_val(bucket.get("doctor_registration_number"))
         name = _str_val(bucket.get("doctor_name"))
-        if (not reg or reg.lower() == "present") or not _is_usable_doctor_name(name):
+        clinic = _str_val(bucket.get("clinic_hospital_name"))
+        if (
+            (not reg or reg.lower() == "present")
+            or not _is_usable_doctor_name(name)
+            or not clinic
+            or clinic.lower() == "present"
+        ):
             return True
     return False
 
@@ -3168,21 +3243,26 @@ def _call_openai_vision(
             date_note = (
                 " DATE ALIASES: sample_collection_date = Registered On, Sample Collected On, "
                 "Collected On, Received On, Scan Date, Examination Date "
-                "(on radiology/HRCT, Registered On IS sample_collection_date). "
-                "report_date = Reported On, Report Date, Date of Report. Use YYYY-MM-DD."
+                "(on radiology/HRCT/CBCT/OPG, Registered On / Scan Date / unlabeled top date "
+                "IS sample_collection_date). "
+                "report_date = Reported On, Report Date, Date of Report, OR unlabeled top-of-page "
+                "study/report date (do not use Date of Birth). Use YYYY-MM-DD."
             )
         rx_note = ""
         if any(
             key in field_list
             for key in (
                 "doctor_name",
+                "clinic_hospital_name",
                 "doctor_registration_number",
                 "doctor_signature",
                 "prescribed_medicines",
             )
         ):
             rx_note = (
-                " RX FOOTER: doctor_name = full printed name or \"\"; "
+                " RX LETTERHEAD: clinic_hospital_name = hospital/clinic title or logo "
+                "(transliterate regional scripts to English; prefer English brand if present); "
+                "doctor_name = full printed name or \"\"; "
                 "doctor_registration_number = Regn no / Reg No / WBMC/MCI (number only); "
                 "doctor_signature = \"present\" if a handwritten signature is visible; "
                 "prescribed_medicines = medicine table rows [{medicine, dosage}]."
@@ -3191,8 +3271,14 @@ def _call_openai_vision(
         if "patient_name" in field_list or "doctor_name" in field_list:
             inv_note = (
                 " CASH MEMO / PHARMACY: patient_name = handwritten name after "
-                "\"Prescribed for\" (or Patient / Name); doctor_name = after \"By Dr\" / Doctor. "
+                "\"Prescribed for\" / Patient / Name / नाव; doctor_name = after \"By Dr\" / Doctor. "
                 "These are different fields — fill both when both lines have handwriting."
+            )
+        if "invoice_number" in field_list:
+            inv_note += (
+                " INVOICE NO: use Bill/Invoice/Receipt/Inv No or regional बिल/रसीद/पावती/क्रमांक; "
+                "if the form only shows a printed serial in the header/top-right with no label, "
+                "that serial IS invoice_number."
             )
         user_text = (
             "Extract ONLY the caller-requested keys into parameters. "
@@ -3258,6 +3344,11 @@ def _apply_doctor_reg_from_refined(
         existing = _str_val(rx.get("doctor_name"))
         if not _is_usable_doctor_name(existing):
             rx["doctor_name"] = name
+    clinic = _str_val(refined.get("clinic_hospital_name"))
+    if clinic and clinic.lower() != "present":
+        existing_clinic = _str_val(rx.get("clinic_hospital_name"))
+        if not existing_clinic or existing_clinic.lower() == "present":
+            rx["clinic_hospital_name"] = clinic
     reg = _str_val(refined.get("doctor_registration_number"))
     if reg and reg.lower() != "present" and not _str_val(rx.get("doctor_registration_number")):
         rx["doctor_registration_number"] = reg
@@ -3276,7 +3367,7 @@ def _refine_doctor_registration_stamp(
     data: Dict[str, Any],
     doc: DocumentPages,
 ) -> None:
-    """Vision pass on header/stamp crops when doctor name or registration is still empty."""
+    """Vision pass on header/stamp crops when doctor/hospital/registration is still empty."""
     stamp_blocks = build_stamp_blocks_from_document(doc.raw, doc=doc)
     header_blocks = build_gst_header_blocks_from_document(doc.raw, doc=doc)
     crop_blocks: List[Dict[str, Any]] = []
@@ -3295,13 +3386,14 @@ def _refine_doctor_registration_stamp(
         DOCTOR_REG_PROMPT,
         (
             "Zoomed letterhead and bottom / signature-zone crops of a prescription or OPD card. "
-            "Find doctor_name on the letterhead (transliterate regional scripts to English) and "
+            "Find clinic_hospital_name and doctor_name on the letterhead "
+            "(transliterate regional scripts to English; use English logo text when present) and "
             "CN No / Reg No on or under the doctor stamp or signature. Ignore CR No / Token / Mobile."
         ),
         crop_blocks,
         "doctor_registration_stamp_extraction",
         DOCTOR_REG_SCHEMA,
-        350,
+        400,
     )
     rx_raw = data.get("prescription_parameters")
     rx: Dict[str, Any] = dict(rx_raw) if isinstance(rx_raw, dict) else {}

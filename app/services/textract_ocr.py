@@ -53,7 +53,12 @@ _DL_LICENCE_SLASH_RE = re.compile(
 )
 
 _INVOICE_NO_RE = re.compile(
-    r"(?:invoice\s*(?:no|number|#)|inv\.?\s*no\.?|bill\s*no\.?|receipt\s*no\.?)"
+    r"(?:"
+    r"invoice\s*(?:no|number|#)|inv\.?\s*no\.?|bill\s*no\.?|receipt\s*no\.?|"
+    r"memo\s*no\.?|cash\s*memo\s*no\.?|serial\s*no\.?|"
+    r"बिल\s*(?:नं\.?|नंबर)?|रसीद\s*(?:नं\.?|नंबर)?|पावती\s*(?:नं\.?|नंबर)?|"
+    r"क्रमांक|अनुक्रमांक"
+    r")"
     r"\s*[:#.\-]?\s*([A-Za-z0-9][A-Za-z0-9/\-]{1,24})",
     re.IGNORECASE,
 )
@@ -85,6 +90,13 @@ _BY_DR_RE = re.compile(
 )
 _FACILITY_LINE_RE = re.compile(
     r"(?:^|\n)\s*Facility\s*[:\-]?\s*([^\n]{3,80})",
+    re.IGNORECASE,
+)
+# Generic English facility title on letterhead (any hospital/clinic name).
+_HOSPITAL_TITLE_RE = re.compile(
+    r"(?:^|\n)\s*([A-Za-z0-9][A-Za-z0-9 .,&'\-]{2,70}?"
+    r"(?:Hospital|Clinic|Multispeciality|Multi[\s\-]?Specialty|Nursing\s*Home|"
+    r"Medical\s*Centre|Medical\s*Center|Polyclinic))\b",
     re.IGNORECASE,
 )
 _APPT_DATE_RE = re.compile(
@@ -356,8 +368,13 @@ def _parse_demographics_from_lines(lines: List[str]) -> Dict[str, str]:
     if not facility:
         fm = _FACILITY_LINE_RE.search(text)
         facility = fm.group(1).strip() if fm else ""
+    if not facility:
+        hm = _HOSPITAL_TITLE_RE.search(text)
+        facility = hm.group(1).strip(" .,-") if hm else ""
     if facility and len(facility) > 3:
-        out["clinic_hospital_name"] = facility
+        # Skip doctor qualification lines mistaken as hospital titles.
+        if not re.search(r"\b(?:M\.?B\.?B\.?S|F\.?C\.?C\.?M|F\.?D\.?M)\b", facility, re.I):
+            out["clinic_hospital_name"] = facility
 
     dm = _APPT_DATE_RE.search(text)
     if dm:
