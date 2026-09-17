@@ -83,6 +83,60 @@ _PRESCRIBED_FOR_RE = re.compile(
     r"(?=\s*(?:By\s*Dr|Doctor|Date|No\.?\b|Particular|$|\n))",
     re.IGNORECASE,
 )
+# OPD Rx pads commonly print "Name :" (not "Patient Name") next to Age/Sex / Date.
+_PATIENT_NAME_LINE_RE = re.compile(
+    r"(?:^|\n)\s*(?:Patient(?:['’]?s)?\s+|Name\s+of\s+(?:the\s+)?Patient\s+|Pt\.?\s+)?"
+    r"Name\s*[:.\-]\s*"
+    r"([A-Za-z][A-Za-z.'\s]{1,60}?)"
+    r"(?=\s*(?:Age\s*/?\s*Sex|Age|Sex|Date|OPD|Regd?\.?\s*No|Mobile|Phone|"
+    r"M\.?R\.?\s*No|CR\s*No|Token|Wt\.?|Weight|Gender|Address|Category|$|\n))",
+    re.IGNORECASE,
+)
+_PATIENT_NAME_STOP_RE = re.compile(
+    r"\s+(?:Age\s*/?\s*Sex|Age|Sex|Date|OPD|Regd?\.?\s*No|Mobile|Phone|"
+    r"M\.?R\.?\s*No|CR\s*No|Token|Wt\.?|Weight|Gender|Address|Category)\b.*$",
+    re.IGNORECASE,
+)
+# Textract often emits handwriting as its own line ABOVE printed Name:/Age/Sex:/Date:.
+_DEMOGRAPHICS_LABEL_LINE_RE = re.compile(
+    r"^(?:Patient(?:['’]?s)?\s+)?(?:Name|Age\s*/?\s*Sex|Age|Sex|Date)\s*[:.\-]?$",
+    re.IGNORECASE,
+)
+_DEMOGRAPHICS_NAME_PREFIX_RE = re.compile(
+    r"^(?:Patient(?:['’]?s)?\s+)?Name\s*[:.\-]",
+    re.IGNORECASE,
+)
+_PERSON_NAME_LINE_RE = re.compile(
+    r"^[A-Za-z][A-Za-z.'\-]{1,30}(?:\s+[A-Za-z][A-Za-z.'\-]{1,30}){0,3}$"
+)
+_HOSPITALISH_NAME_RE = re.compile(
+    r"\b(?:hospital|clinic|pharmacy|medical\s+(?:store|centre|center)|"
+    r"nursing\s*home|multispeciality|multi[\s\-]?specialty)\b",
+    re.IGNORECASE,
+)
+_NON_PERSON_NAME_TOKENS = frozenset(
+    {
+        "age",
+        "sex",
+        "date",
+        "name",
+        "patient",
+        "hospital",
+        "clinic",
+        "pharmacy",
+        "physician",
+        "doctor",
+        "dr",
+        "mbbs",
+        "timings",
+        "medical",
+        "store",
+        "nursing",
+        "home",
+        "general",
+        "opd",
+    }
+)
 _BY_DR_RE = re.compile(
     r"By\s*Dr\.?\s*[:.\-\s]*([A-Za-z][A-Za-z.'\s]{1,60}?)"
     r"(?=\s*(?:Date|No\.?\b|Particular|Prescribed|Age|Sex|$|\n))",
@@ -94,10 +148,24 @@ _FACILITY_LINE_RE = re.compile(
 )
 # Generic English facility title on letterhead (any hospital/clinic name).
 _HOSPITAL_TITLE_RE = re.compile(
-    r"(?:^|\n)\s*([A-Za-z0-9][A-Za-z0-9 .,&'\-]{2,70}?"
-    r"(?:Hospital|Clinic|Multispeciality|Multi[\s\-]?Specialty|Nursing\s*Home|"
-    r"Medical\s*Centre|Medical\s*Center|Polyclinic))\b",
+    r"(?:^|\n)\s*([A-Za-z0-9][A-Za-z0-9 .,&'\-]{0,70}?"
+    r"(?:Hospitals?|Clinic|Multispeciality|Multi[\s\-]?Specialty|Nursing\s*Home|"
+    r"Medical\s*Centre|Medical\s*Center|Polyclinic|"
+    r"Institute(?:\s+of\s+Medical\s+Sciences)?|Medical\s+Sciences))\b",
     re.IGNORECASE,
+)
+# Logo OCR often splits brand + HOSPITALS across two lines (e.g. SRI\nHOSPITALS).
+_SPLIT_HOSPITAL_LOGO_RE = re.compile(
+    r"(?:^|\n)\s*([A-Za-z][A-Za-z0-9.&']{1,24})\s*\n\s*"
+    r"(Hospitals?|Clinic|Multispeciality|Multi[\s\-]?Specialty|"
+    r"Nursing\s*Home|Medical\s*(?:Centre|Center)|Polyclinic|"
+    r"Institute(?:\s+of\s+Medical\s+Sciences)?)\b",
+    re.IGNORECASE,
+)
+# Regional-script hospital words (Tamil/Hindi/etc.) — map to English when logo OCR fails.
+_REGIONAL_HOSPITAL_HINT_RE = re.compile(
+    r"(மருத்துவமனை|கிளினிக்|अस्पताल|हॉस्पिटल|क्लिनिक|"
+    r"హాస్పిటల్|క్లినిక్|ಆಸ್ಪತ್ರೆ|ആശുപത്രി|হাসপাতাল)",
 )
 _APPT_DATE_RE = re.compile(
     r"(?:Appt\.?\s*Dt|Note\s*Dt|Visit\s*Date|Date)\s*[:\-]?\s*"
@@ -117,6 +185,44 @@ _IOP_RE = re.compile(
     re.IGNORECASE,
 )
 _VA_RE = re.compile(r"\bVA\s*:?\s*([^\n]{3,40})", re.IGNORECASE)
+
+
+def _extract_hospital_title(text: str) -> str:
+    """Letterhead hospital/clinic title from one line, split logo lines, or regional script."""
+    if not text:
+        return ""
+    # Prefer English logo split across lines (SRI\nHOSPITALS) — common on circular logos.
+    split = _SPLIT_HOSPITAL_LOGO_RE.search(text)
+    if split:
+        brand = split.group(1).strip(" .,-")
+        kind = split.group(2).strip(" .,-")
+        # Skip noise tokens that are not brand names.
+        if brand and brand.lower() not in {"the", "and", "for", "dr", "born", "save"}:
+            return f"{brand} {kind}".strip()
+    hm = _HOSPITAL_TITLE_RE.search(text)
+    if hm:
+        return hm.group(1).strip(" .,-")
+    # Standalone HOSPITALS line with a short brand line immediately above.
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for idx, line in enumerate(lines):
+        if re.fullmatch(r"Hospitals?", line, re.IGNORECASE) and idx > 0:
+            prev = lines[idx - 1]
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9.&']{1,24}", prev):
+                return f"{prev} {line}"
+    # Regional script present but English OCR failed — still signal a hospital letterhead.
+    # Callers/OpenAI should prefer a proper English name; Textract may only see Tamil glyphs.
+    if _REGIONAL_HOSPITAL_HINT_RE.search(text):
+        # Try any nearby Latin brand token before the regional hospital word.
+        for m in _REGIONAL_HOSPITAL_HINT_RE.finditer(text):
+            window = text[max(0, m.start() - 80) : m.start()]
+            latin = re.findall(r"\b([A-Z][A-Za-z0-9.&']{1,20})\b", window)
+            if latin:
+                brand = latin[-1]
+                if brand.lower() not in {"dr", "date", "name", "age", "regn", "reg"}:
+                    return f"{brand} Hospital"
+        return "Hospital"
+    return ""
+
 
 # --- Payment receipt / UPI / bank transfer cues ---
 # Require PSP-like handles; reject emails (info@hospital / name@domain.com).
@@ -299,7 +405,9 @@ def _extract_gstin(text: str) -> str:
 
 def _value_after_label(lines: List[str], labels: Sequence[str]) -> str:
     """Return the next non-empty line after a label line (or same-line value)."""
-    label_set = {lab.lower() for lab in labels}
+    # Longer labels first so "Patient Name" wins over bare "Patient" / "Name".
+    ordered = sorted(labels, key=lambda lab: len(lab), reverse=True)
+    label_set = {lab.lower() for lab in ordered}
     for idx, line in enumerate(lines):
         raw = line.strip()
         low = re.sub(r"[:.\-\s]+$", "", raw.lower())
@@ -309,18 +417,188 @@ def _value_after_label(lines: List[str], labels: Sequence[str]) -> str:
                 if nxt and re.sub(r"[:.\-\s]+$", "", nxt.lower()) not in label_set:
                     return nxt
             continue
-        for lab in labels:
+        for lab in ordered:
             lab_low = lab.lower()
-            if low.startswith(lab_low):
-                # Same-line value after "Prescribed for:...... Name" / "By Dr....... Name"
-                rest = raw[len(lab) :].lstrip(" :.-")
-                if rest:
-                    return rest
-                if idx + 1 < len(lines):
-                    nxt = lines[idx + 1].strip().lstrip(".:- ")
-                    if nxt and re.sub(r"[:.\-\s]+$", "", nxt.lower()) not in label_set:
-                        return nxt
+            # Bare "Name" must be a label token (Name / Name:) — not "Named …".
+            if lab_low == "name":
+                if not low.startswith("name") or re.match(r"^name[a-z]", low):
+                    continue
+            elif lab_low == "clinic":
+                # Do not match "Clinical Notes/Prescriptions" as a Clinic label.
+                if not (
+                    low == "clinic"
+                    or low.startswith("clinic ")
+                    or low.startswith("clinic:")
+                    or low.startswith("clinic-")
+                    or low.startswith("clinic.")
+                ):
+                    continue
+            elif lab_low == "hospital":
+                # Do not treat standalone "HOSPITALS" logo line as Hospital:<value>.
+                if not (
+                    low == "hospital"
+                    or low.startswith("hospital ")
+                    or low.startswith("hospital:")
+                    or low.startswith("hospital-")
+                    or low.startswith("hospital.")
+                ):
+                    continue
+            elif not low.startswith(lab_low):
+                continue
+            # Same-line value after "Prescribed for:...... Name" / "By Dr....... Name"
+            rest = raw[len(lab) :].lstrip(" :.-")
+            if rest:
+                return rest
+            if idx + 1 < len(lines):
+                nxt = lines[idx + 1].strip().lstrip(".:- ")
+                if nxt and re.sub(r"[:.\-\s]+$", "", nxt.lower()) not in label_set:
+                    return nxt
     return ""
+
+
+def _clean_patient_name_value(raw: str) -> str:
+    """Strip trailing Age/Sex/Date tails from a same-line Name capture."""
+    name = (raw or "").strip(" .:-")
+    if not name:
+        return ""
+    name = _PATIENT_NAME_STOP_RE.sub("", name).strip(" .:-")
+    # Reject non-name leftovers (dates, amounts, single tokens that are labels).
+    if not name or re.fullmatch(r"[\d./\-]+", name):
+        return ""
+    if re.match(r"^(?:age|sex|date|name|patient)\b", name, re.IGNORECASE):
+        return ""
+    if name.lower() in _NON_PERSON_NAME_TOKENS:
+        return ""
+    if _HOSPITALISH_NAME_RE.search(name):
+        return ""
+    tokens = re.findall(r"[A-Za-z]+", name)
+    if not tokens or any(tok.lower() in _NON_PERSON_NAME_TOKENS for tok in tokens):
+        return ""
+    if len(name) < 3:
+        return ""
+    return name
+
+
+def _looks_like_person_name(raw: str) -> bool:
+    """True for a short alphabetic person-name line (not hospital / label junk)."""
+    name = _clean_patient_name_value(raw)
+    if not name or not _PERSON_NAME_LINE_RE.match(name):
+        return False
+    tokens = name.split()
+    # Prefer multi-token Indian names; allow long single tokens (e.g. "Susheela").
+    if len(tokens) == 1 and len(tokens[0]) < 5:
+        return False
+    return True
+
+
+def _orphan_patient_name_near_demographics(lines: List[str]) -> str:
+    """Recover handwriting Textract placed above/below printed Name:/Age/Sex:/Date:."""
+    demo_indexes: List[int] = []
+    for idx, line in enumerate(lines):
+        raw = line.strip()
+        if not raw:
+            continue
+        if _DEMOGRAPHICS_LABEL_LINE_RE.match(raw) or _DEMOGRAPHICS_NAME_PREFIX_RE.match(raw):
+            demo_indexes.append(idx)
+    if not demo_indexes:
+        return ""
+    # Prefer the Name label when present; otherwise first demographics cue.
+    name_idx = next(
+        (
+            i
+            for i in demo_indexes
+            if re.match(r"^(?:Patient(?:['’]?s)?\s+)?Name\b", lines[i].strip(), re.I)
+        ),
+        demo_indexes[0],
+    )
+
+    def _scan(indexes: Sequence[int]) -> str:
+        for j in indexes:
+            if j < 0 or j >= len(lines):
+                continue
+            cand = lines[j].strip()
+            if not cand or _DEMOGRAPHICS_LABEL_LINE_RE.match(cand):
+                continue
+            if _DEMOGRAPHICS_NAME_PREFIX_RE.match(cand):
+                # "Name : X" — ignore OCR junk on the label line itself.
+                continue
+            if re.fullmatch(r"[\d./\-():\s]+", cand):
+                continue
+            if _looks_like_person_name(cand):
+                return _clean_patient_name_value(cand)
+        return ""
+
+    # Handwriting is usually above the printed labels; also try a short window below.
+    found = _scan(range(name_idx - 1, max(-1, name_idx - 6), -1))
+    if found:
+        return found
+    return _scan(range(name_idx + 1, min(len(lines), name_idx + 5)))
+
+
+def _append_patient_name_continuation(lines: List[str], patient: str) -> str:
+    """Join a second handwritten name line under Patient Name (e.g. Lakshmi)."""
+    base = _clean_patient_name_value(patient)
+    if not base:
+        return ""
+    name_idx = next(
+        (
+            i
+            for i, line in enumerate(lines)
+            if re.match(
+                r"^(?:Patient(?:['’]?s)?\s+)?Name\s*[:.\-]",
+                line.strip(),
+                re.IGNORECASE,
+            )
+        ),
+        None,
+    )
+    if name_idx is None:
+        return base
+    name_line = lines[name_idx].strip()
+    # Only continue when the labeled Name line already holds the first part
+    # (avoids appending Rx body tokens like "SOB" after orphan-name recovery).
+    first_token = base.split()[0].lower()
+    if first_token not in name_line.lower():
+        return base
+    for j in range(name_idx + 1, min(len(lines), name_idx + 5)):
+        cand = lines[j].strip()
+        if not cand:
+            continue
+        if _DEMOGRAPHICS_LABEL_LINE_RE.match(cand) or re.match(
+            r"^(?:Time|Wt\.?|Weight|Rx|Temp|Date|Address|Category|Mobile|Department|"
+            r"Doctor|Room|OPD|CR\s*No|Card|ALERTS?|DIAGNOSIS|Investigations?)\b",
+            cand,
+            re.IGNORECASE,
+        ):
+            continue
+        if re.fullmatch(r"[\d./\-():\s]+", cand):
+            continue
+        # Stop at labeled rows like "Address : ..." / "Category Paying".
+        if re.match(r"^[A-Za-z][A-Za-z /]{1,20}\s*[:\-]", cand):
+            continue
+        cont = _clean_patient_name_value(cand)
+        if not cont or not _PERSON_NAME_LINE_RE.match(cont):
+            continue
+        # Only append short leftover tokens (surname / last part), not a new full name.
+        if len(cont.split()) != 1:
+            continue
+        if cont.lower() in base.lower():
+            continue
+        # Reject common form words OCR'd as a "name" continuation.
+        if cont.lower() in _NON_PERSON_NAME_TOKENS | {
+            "address",
+            "category",
+            "paying",
+            "mobile",
+            "department",
+            "doctor",
+            "room",
+            "alerts",
+            "diagnosis",
+        }:
+            continue
+        return f"{base} {cont}".strip()
+    return base
 
 
 def _parse_demographics_from_lines(lines: List[str]) -> Dict[str, str]:
@@ -347,12 +625,35 @@ def _parse_demographics_from_lines(lines: List[str]) -> Dict[str, str]:
 
     patient = _value_after_label(
         lines,
-        ["Patient", "Patient Name", "Patient's Name", "Prescribed for", "Prescribed For"],
+        [
+            "Patient Name",
+            "Patient's Name",
+            "Name of Patient",
+            "Name of the Patient",
+            "Beneficiary Name",
+            "Pt. Name",
+            "Pt Name",
+            "Patient",
+            "Prescribed for",
+            "Prescribed For",
+            "Name",
+        ],
     )
+    # Same-line "Name : Age / Sex : ..." means the handwritten value was not OCR'd
+    # on that line — do not treat the next printed label as the patient name.
+    if patient and re.match(r"^(?:age|sex|date)\b", patient.strip(), re.IGNORECASE):
+        patient = ""
+    if not patient:
+        nm = _PATIENT_NAME_LINE_RE.search(text)
+        patient = nm.group(1).strip(" .") if nm else ""
     if not patient:
         pm = _PRESCRIBED_FOR_RE.search(text)
         patient = pm.group(1).strip(" .") if pm else ""
-    if patient and len(patient) > 2:
+    patient = _clean_patient_name_value(patient)
+    if not patient:
+        patient = _orphan_patient_name_near_demographics(lines)
+    if patient:
+        patient = _append_patient_name_continuation(lines, patient)
         out["patient_name"] = patient
 
     doctor = _value_after_label(
@@ -365,16 +666,23 @@ def _parse_demographics_from_lines(lines: List[str]) -> Dict[str, str]:
         out["doctor_name"] = doctor
 
     facility = _value_after_label(lines, ["Facility", "Hospital", "Clinic"])
+    if facility and (
+        len(facility) < 4
+        or re.search(r"\bnotes?/prescriptions?\b", facility, re.I)
+        or re.match(r"^(?:clinical|investigations?|diagnosis|alerts?)\b", facility, re.I)
+        or re.fullmatch(r"[A-Za-z]", facility)
+    ):
+        facility = ""
     if not facility:
         fm = _FACILITY_LINE_RE.search(text)
         facility = fm.group(1).strip() if fm else ""
     if not facility:
-        hm = _HOSPITAL_TITLE_RE.search(text)
-        facility = hm.group(1).strip(" .,-") if hm else ""
+        facility = _extract_hospital_title(text)
     if facility and len(facility) > 3:
         # Skip doctor qualification lines mistaken as hospital titles.
         if not re.search(r"\b(?:M\.?B\.?B\.?S|F\.?C\.?C\.?M|F\.?D\.?M)\b", facility, re.I):
-            out["clinic_hospital_name"] = facility
+            if not re.search(r"\bnotes?/prescriptions?\b", facility, re.I):
+                out["clinic_hospital_name"] = facility
 
     dm = _APPT_DATE_RE.search(text)
     if dm:
@@ -765,14 +1073,17 @@ def extract_textract_fields(
     # Ignore truncated vendor tokens like "DrA"
     if provider and len(re.sub(r"[^A-Za-z]", "", provider)) < 4:
         provider = ""
-    patient = (
-        demo.get("patient_name")
-        or expense.get("NAME")
-        or expense.get("CUSTOMER_NAME")
-        or expense.get("RECEIVER_NAME")
-        or ""
-    ).strip()
+    patient = _clean_patient_name_value(demo.get("patient_name") or "")
+    if not patient:
+        for key in ("NAME", "CUSTOMER_NAME", "RECEIVER_NAME"):
+            candidate = _clean_patient_name_value(expense.get(key) or "")
+            if candidate:
+                patient = candidate
+                break
+    clinic = (demo.get("clinic_hospital_name") or "").strip()
     if patient and provider and patient.lower() == provider.lower():
+        patient = ""
+    if patient and clinic and patient.lower() == clinic.lower():
         patient = ""
 
     payment = _extract_payment_fields(text)
@@ -827,6 +1138,216 @@ def _log_textract_error(operation: str, exc: Exception) -> None:
     logger.exception("Textract %s failed", operation)
 
 
+def _usable_patient_name(raw: Any) -> str:
+    """Return a cleaned person name, or "" if empty / hospital / placeholder."""
+    name = _clean_patient_name_value(str(raw or ""))
+    if not name:
+        return ""
+    low = name.lower().strip()
+    if low in {
+        "n/a",
+        "na",
+        "nil",
+        "none",
+        "null",
+        "-",
+        "--",
+        "unknown",
+        "not available",
+        "not applicable",
+        "not visible",
+        "missing",
+        "present",
+    }:
+        return ""
+    if _HOSPITALISH_NAME_RE.search(name):
+        return ""
+    return name
+
+
+def sync_patient_name_across_buckets(data: Dict[str, Any]) -> None:
+    """Copy shared identity fields into every claim bucket (stops false missing escalations)."""
+    if not isinstance(data, dict):
+        return
+    buckets: List[Dict[str, Any]] = []
+    for key in (
+        "parameters",
+        "prescription_parameters",
+        "invoice_parameters",
+        "report_parameters",
+    ):
+        raw = data.get(key)
+        if isinstance(raw, dict):
+            buckets.append(raw)
+        else:
+            bucket: Dict[str, Any] = {}
+            data[key] = bucket
+            buckets.append(bucket)
+
+    _PLACEHOLDER = {
+        "n/a",
+        "na",
+        "nil",
+        "none",
+        "null",
+        "-",
+        "--",
+        "unknown",
+        "not available",
+        "not applicable",
+        "not visible",
+        "missing",
+    }
+
+    def _is_empty(val: Any, *, treat_present_as_filled: bool = False) -> bool:
+        s = str(val or "").strip()
+        if not s:
+            return True
+        low = s.lower()
+        if treat_present_as_filled and low == "present":
+            return False
+        return low in _PLACEHOLDER or low == "present"
+
+    def _best(key: str, *, patient: bool = False) -> str:
+        best = ""
+        for bucket in buckets:
+            raw_val = bucket.get(key)
+            if patient:
+                cand = _usable_patient_name(raw_val)
+            else:
+                cand = str(raw_val or "").strip()
+                if _is_empty(cand, treat_present_as_filled=(key in {
+                    "doctor_signature",
+                    "doctor_stamp",
+                    "authorized_stamp",
+                    "authorized_signature",
+                })):
+                    cand = ""
+            if cand and (not best or len(cand) > len(best)):
+                best = cand
+        return best
+
+    def _fill(key: str, value: str, *, patient: bool = False) -> None:
+        if not value:
+            return
+        for bucket in buckets:
+            cur = bucket.get(key)
+            if patient:
+                if _usable_patient_name(cur):
+                    continue
+                bucket[key] = value
+                continue
+            if _is_empty(
+                cur,
+                treat_present_as_filled=(
+                    key
+                    in {
+                        "doctor_signature",
+                        "doctor_stamp",
+                        "authorized_stamp",
+                        "authorized_signature",
+                    }
+                ),
+            ):
+                bucket[key] = value
+
+    _fill("patient_name", _best("patient_name", patient=True), patient=True)
+    for key in (
+        "patient_age",
+        "patient_gender",
+        "doctor_name",
+        "doctor_registration_number",
+        "consultation_date",
+        "clinic_hospital_address",
+        "provider_address",
+        "laboratory_address",
+    ):
+        _fill(key, _best(key))
+
+    facility = (
+        _best("clinic_hospital_name")
+        or _best("provider_name")
+        or _best("laboratory_name")
+    )
+    if facility:
+        for key in ("clinic_hospital_name", "provider_name", "laboratory_name"):
+            _fill(key, facility)
+
+    for key in (
+        "doctor_signature",
+        "doctor_stamp",
+        "authorized_stamp",
+        "authorized_signature",
+    ):
+        _fill(key, _best(key))
+
+
+def fill_demographics_from_text(data: Dict[str, Any], text: str) -> None:
+    """Fill empty patient/clinic demographics from OCR or PDF text into all buckets."""
+    if not isinstance(data, dict) or not (text or "").strip():
+        return
+    demo = _parse_demographics_from_lines(text.splitlines())
+    patient = _usable_patient_name(demo.get("patient_name"))
+    clinic = str(demo.get("clinic_hospital_name") or "").strip()
+    doctor = str(demo.get("doctor_name") or "").strip()
+    age = str(demo.get("patient_age") or "").strip()
+    gender = str(demo.get("patient_gender") or "").strip()
+    consult = str(demo.get("consultation_date") or "").strip()
+
+    def _blank(val: Any) -> bool:
+        s = str(val or "").strip()
+        return not s or s.lower() in {
+            "n/a",
+            "na",
+            "nil",
+            "none",
+            "null",
+            "-",
+            "--",
+            "unknown",
+            "not available",
+            "not applicable",
+            "not visible",
+            "missing",
+            "present",
+        }
+
+    for key in (
+        "parameters",
+        "prescription_parameters",
+        "invoice_parameters",
+        "report_parameters",
+    ):
+        raw = data.get(key)
+        bucket: Dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+        if patient and not _usable_patient_name(bucket.get("patient_name")):
+            bucket["patient_name"] = patient
+        if clinic and _blank(bucket.get("clinic_hospital_name")):
+            if key in ("parameters", "prescription_parameters"):
+                bucket["clinic_hospital_name"] = clinic
+        if clinic and _blank(bucket.get("provider_name")) and key in (
+            "parameters",
+            "invoice_parameters",
+        ):
+            bucket["provider_name"] = clinic
+        if clinic and _blank(bucket.get("laboratory_name")) and key in (
+            "parameters",
+            "report_parameters",
+        ):
+            bucket["laboratory_name"] = clinic
+        if doctor and _blank(bucket.get("doctor_name")):
+            bucket["doctor_name"] = doctor
+        if age and _blank(bucket.get("patient_age")):
+            bucket["patient_age"] = age
+        if gender and _blank(bucket.get("patient_gender")):
+            bucket["patient_gender"] = gender
+        if consult and _blank(bucket.get("consultation_date")):
+            bucket["consultation_date"] = consult
+        data[key] = bucket
+
+    sync_patient_name_across_buckets(data)
+
+
 def merge_textract_into_openai_data(
     data: Dict[str, Any],
     ocr: Dict[str, str],
@@ -835,9 +1356,33 @@ def merge_textract_into_openai_data(
     if not ocr:
         return
 
+    _PLACEHOLDER_LOW = frozenset(
+        {
+            "n/a",
+            "na",
+            "nil",
+            "none",
+            "null",
+            "-",
+            "--",
+            "unknown",
+            "not available",
+            "not applicable",
+            "not visible",
+            "missing",
+            "present",
+        }
+    )
+
     def _blank(val: Any) -> bool:
         s = str(val or "").strip()
-        return not s or s.lower() == "present"
+        return not s or s.lower() in _PLACEHOLDER_LOW
+
+    def _should_fill_patient(existing: Any, ocr_val: str) -> bool:
+        if not _clean_patient_name_value(ocr_val):
+            return False
+        cur = str(existing or "").strip()
+        return _blank(cur) or bool(_HOSPITALISH_NAME_RE.search(cur))
 
     inv_raw = data.get("invoice_parameters")
     inv: Dict[str, Any] = dict(inv_raw) if isinstance(inv_raw, dict) else {}
@@ -897,17 +1442,47 @@ def merge_textract_into_openai_data(
 
     for key in invoice_fill_keys:
         ocr_val = (ocr.get(key) or "").strip()
-        if ocr_val and _blank(inv.get(key)):
+        if not ocr_val:
+            continue
+        if key == "patient_name":
+            if _should_fill_patient(inv.get(key), ocr_val):
+                inv[key] = ocr_val
+            continue
+        if _blank(inv.get(key)):
             inv[key] = ocr_val
 
     for key in rx_fill_keys:
         ocr_val = (ocr.get(key) or "").strip()
-        if ocr_val and _blank(rx.get(key)):
+        if not ocr_val:
+            continue
+        if key == "patient_name":
+            if _should_fill_patient(rx.get(key), ocr_val):
+                rx[key] = ocr_val
+            continue
+        if key == "clinic_hospital_name":
+            existing_clinic = str(rx.get(key) or "").strip()
+            junk_clinic = bool(
+                re.search(r"\bnotes?/prescriptions?\b", existing_clinic, re.I)
+            )
+            if (
+                (_blank(existing_clinic) or junk_clinic)
+                and ocr_val
+                and not re.search(r"\bnotes?/prescriptions?\b", ocr_val, re.I)
+            ):
+                rx[key] = ocr_val
+            continue
+        if _blank(rx.get(key)):
             rx[key] = ocr_val
 
     for key in report_fill_keys:
         ocr_val = (ocr.get(key) or "").strip()
-        if ocr_val and _blank(rep.get(key)):
+        if not ocr_val:
+            continue
+        if key == "patient_name":
+            if _should_fill_patient(rep.get(key), ocr_val):
+                rep[key] = ocr_val
+            continue
+        if _blank(rep.get(key)):
             rep[key] = ocr_val
 
     for key in payment_fill_keys:
@@ -943,10 +1518,18 @@ def merge_textract_into_openai_data(
     params: Dict[str, Any] = dict(params_raw) if isinstance(params_raw, dict) else {}
     for key, raw in ocr.items():
         ocr_val = str(raw or "").strip()
+        if not ocr_val:
+            continue
+        if key == "patient_name":
+            if _should_fill_patient(params.get(key), ocr_val):
+                params[key] = ocr_val
+            continue
         if ocr_val and _blank(params.get(key)):
             params[key] = ocr_val
     if params:
         data["parameters"] = params
+
+    sync_patient_name_across_buckets(data)
 
     category = str(data.get("document_category", "other"))
     # Strong payment proof only — never flip on a lone email-like "@" token.
