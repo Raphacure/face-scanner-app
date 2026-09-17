@@ -12,7 +12,6 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from concurrent.futures import ThreadPoolExecutor
 from openai import APIStatusError, RateLimitError
 
 from app.aws.textract_client import textract_enabled
@@ -533,6 +532,10 @@ PAYMENT_RECEIPT_PARAMS_SCHEMA = _param_object_schema(
 
 SYSTEM_PROMPT = """Indian medical claims OCR. Fill JSON; use "" / [] if absent. Signatures/stamps: "present" if visible but illegible.
 
+PIPELINE: OCR text is extracted first. Your job is to MAP OCR (and image if attached) into
+parameter fields. Prefer clear OCR values; use the image to fix handwriting, logos, and OCR
+errors. Never invent values that are not in OCR or on the image.
+
 EXTRACTION RULE (critical): Map EVERY visible value into the matching parameter fields.
 Fill prescription_parameters AND invoice_parameters AND report_parameters AND payment_receipt_parameters
 whenever those fields appear on the page — irrespective of document_category. Category is only a
@@ -644,6 +647,8 @@ Never leave report_date empty when a report/study date is printed on the page.
 """
 
 FIELDS_SYSTEM_PROMPT = """Indian medical claims OCR. Fill JSON; use "" / [] if a value is not printed.
+PIPELINE: OCR text is extracted first. Map OCR (and image if attached) into parameters using the
+exact keys the caller requested. Prefer clear OCR; use the image to fix handwriting/logos/OCR errors.
 Put extracted values in parameters using the exact keys the caller requested.
 Read EVERY attached page (multi-page PDFs). Headers AND footers matter:
 Prescribed by / (Dr. Name) / Regn no are often at the bottom of a later page.
@@ -895,28 +900,94 @@ def _build_slim_document_schema(fields: Sequence[str]) -> Dict[str, Any]:
 
 
 def use_textract_for_category_hint(hint: str) -> bool:
-    """Run Textract for medical docs that carry patient demographics.
-
-    CRM hints used to skip Textract for prescriptions (speed), but OpenAI-only
-    often leaves handwritten patient_name empty → upstream \"missing\" rejects.
-    """
+    """Always prefer Textract extract-first when AWS OCR is enabled."""
     if not textract_enabled():
         return False
-    normalized = normalize_document_name_hint(hint)
-    if not normalized:
+    # Payment proofs and unknown labels still benefit from OCR text for mapping.
+    return True
+
+
+def _ocr_raw_text(ocr: Optional[Dict[str, str]]) -> str:
+    if not ocr:
+        return ""
+    return str(ocr.get("raw_text") or "").strip()
+
+
+def _ocr_is_weak(ocr: Optional[Dict[str, str]], category_hint: Optional[str] = None) -> bool:
+    """True when OCR alone is too thin — OpenAI should also see the image."""
+    if not ocr:
         return True
-    # Always OCR Rx / invoice / lab — patient_name and letterhead live here.
-    if normalized in {"prescription", "invoice", "report"}:
+    text = _ocr_raw_text(ocr)
+    letters = len(re.findall(r"[A-Za-z\u0900-\u0D7F]", text))
+    if len(text) < 80 or letters < 40:
         return True
-    only_invoice = (os.getenv("TEXTRACT_HINT_INVOICE_ONLY") or "false").strip().lower() in (
+    hint = normalize_document_name_hint(category_hint)
+    patient = str(ocr.get("patient_name") or "").strip()
+    facility = (
+        str(ocr.get("clinic_hospital_name") or "").strip()
+        or str(ocr.get("provider_name") or "").strip()
+    )
+    doctor = str(ocr.get("doctor_name") or "").strip()
+    # Prescription/OPD: need vision if patient or hospital letterhead still missing.
+    if hint in {"prescription", "opd", ""}:
+        if not patient or not facility:
+            return True
+    elif hint == "invoice":
+        if not patient and not facility:
+            return True
+    elif hint == "report":
+        if not patient:
+            return True
+    elif not (patient or facility or doctor):
+        return True
+    force_vision = (os.getenv("OPENAI_ALWAYS_VISION") or "false").strip().lower() in (
         "1",
         "true",
         "yes",
         "on",
     )
-    if only_invoice:
-        return normalized == "invoice"
-    return True
+    return force_vision
+
+
+def _ocr_context_for_prompt(ocr: Optional[Dict[str, str]]) -> str:
+    """Attach complete extracted document text so OpenAI maps into API parameters."""
+    if not ocr:
+        return (
+            " No extracted text was available. Read the attached image(s) and map every visible "
+            "value into the JSON parameters."
+        )
+    text = _ocr_raw_text(ocr)
+    # Cap prompt size — keep letterhead + demographics + body.
+    if len(text) > 12000:
+        text = text[:12000] + "\n…[extract truncated]…"
+    hints = []
+    for key in (
+        "patient_name",
+        "patient_age",
+        "patient_gender",
+        "doctor_name",
+        "clinic_hospital_name",
+        "provider_name",
+        "consultation_date",
+        "invoice_number",
+        "invoice_date",
+        "total_amount",
+        "gst_number",
+        "drug_license_number",
+    ):
+        val = str(ocr.get(key) or "").strip()
+        if val:
+            hints.append(f"{key}={val}")
+    hint_block = (", ".join(hints)) if hints else "(none pre-parsed)"
+    return (
+        " STEP 1 already done: COMPLETE document text was extracted from the PDF/image. "
+        "STEP 2 (your job): ANALYZE that extract and MAP it into the API parameter fields. "
+        "Prefer extracted values when clear; use the image only if attached to fix "
+        "handwriting, logos, or OCR errors. Transliterate regional scripts to English. "
+        "Do not invent values absent from the extract and image.\n"
+        f"EXTRACTED_FIELD_HINTS: {hint_block}\n"
+        f"COMPLETE_EXTRACTED_TEXT:\n\"\"\"\n{text}\n\"\"\""
+    )
 
 
 def _openai_max_tokens_for_hint(hint: str) -> int:
@@ -3317,12 +3388,26 @@ def _call_openai_vision(
     image_blocks: List[Dict[str, Any]],
     category_hint: Optional[str] = None,
     extract_fields: Optional[Sequence[str]] = None,
+    ocr: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
+    """Map OCR (+ optional image) into claim parameters.
+
+    Ideal flow: Textract extracts text first; OpenAI maps into parameters.
+    Images are attached only when OCR is weak (or always if OPENAI_ALWAYS_VISION).
+    """
+    use_images = _ocr_is_weak(ocr, category_hint)
+    vision_blocks = image_blocks if use_images else []
     page_note = (
         " Multiple pages attached — read all pages and merge extracted fields."
-        if len(image_blocks) > 1
+        if len(vision_blocks) > 1
         else ""
     )
+    if use_images:
+        page_note += " Image(s) attached because OCR was weak or incomplete — use them."
+    else:
+        page_note += " No image attached — map strictly from OCR_RAW_TEXT / OCR_STRUCTURED_HINTS."
+
+    ocr_note = _ocr_context_for_prompt(ocr)
     hint = normalize_document_name_hint(category_hint)
     field_list = tuple(extract_fields or ())
     hint_note = ""
@@ -3376,14 +3461,15 @@ def _call_openai_vision(
                 "that serial IS invoice_number."
             )
         user_text = (
-            "Extract ONLY the caller-requested keys into parameters. "
+            "Map OCR into ONLY the caller-requested keys in parameters. "
             f"TARGET FIELDS: {targets}. "
-            "Use \"\" or [] if a value is not printed. Do not invent values."
+            "Use \"\" or [] if a value is not present. Do not invent values."
             + date_note
             + rx_note
             + inv_note
             + page_note
             + hint_note
+            + ocr_note
         )
         schema = _build_slim_document_schema(field_list)
         max_tokens = _openai_max_tokens_for_request(hint or "", field_list)
@@ -3397,9 +3483,10 @@ def _call_openai_vision(
                 "Do not reclassify away from the caller label."
             )
         user_text = (
-            "Classify content type and extract ALL visible parameters into every matching "
-            "bucket (prescription_parameters, invoice_parameters, report_parameters, "
-            "payment_receipt_parameters). Do not skip a field because of document_category."
+            "Map OCR (+ image if attached) into ALL matching parameter buckets "
+            "(prescription_parameters, invoice_parameters, report_parameters, "
+            "payment_receipt_parameters). Classify content type. "
+            "Do not skip a field because of document_category."
             + page_note
             + hint_note
             + (
@@ -3411,6 +3498,7 @@ def _call_openai_vision(
                     "pages, or unrelated non-claim images."
                 )
             )
+            + ocr_note
         )
         schema = DOCUMENT_SCHEMA
         max_tokens = _openai_max_tokens_for_request(hint or "", None)
@@ -3420,7 +3508,7 @@ def _call_openai_vision(
         model,
         system_prompt,
         user_text,
-        image_blocks,
+        vision_blocks,
         "medical_document_extraction",
         schema,
         max_tokens,
@@ -3616,16 +3704,177 @@ def _run_textract_ocr(doc: DocumentPages) -> Dict[str, str]:
         return {}
 
 
+def _extract_complete_document_data(doc: DocumentPages) -> Dict[str, str]:
+    """Step 1 — extract ALL readable text/fields from the PDF or image first.
+
+    Combines Textract OCR (+ expense) with embedded PDF text when present.
+    OpenAI must map FROM this extract into API parameters (step 2).
+    """
+    ocr = _run_textract_ocr(doc) or {}
+    if not ocr:
+        ocr = {key: "" for key in (
+            "gst_number",
+            "drug_license_number",
+            "invoice_number",
+            "invoice_date",
+            "total_amount",
+            "provider_name",
+            "patient_name",
+            "provider_address",
+            "patient_age",
+            "patient_gender",
+            "doctor_name",
+            "clinic_hospital_name",
+            "consultation_date",
+            "diagnosis",
+            "visual_acuity_details",
+            "provider_contact",
+            "payment_mode",
+            "payment_amount",
+            "transaction_date",
+            "transaction_id",
+            "reference_number",
+            "utr",
+            "payer_name",
+            "payee_name",
+            "upi_id",
+            "bank_name",
+            "payment_status",
+            "payment_time",
+            "account_number_masked",
+            "ifsc",
+            "remarks",
+            "raw_text",
+        )}
+
+    pdf_text = ""
+    if doc.is_pdf:
+        try:
+            pdf_text = extract_pdf_text(doc.raw, max_pages=pdf_vision_max_pages()) or ""
+        except Exception:
+            logger.exception("PDF text extract failed during complete extract")
+            pdf_text = ""
+
+    textract_text = str(ocr.get("raw_text") or "").strip()
+    # Prefer the longer complete text body for mapping.
+    if pdf_text and len(pdf_text.strip()) > len(textract_text):
+        combined = pdf_text.strip()
+        if textract_text and textract_text not in combined:
+            combined = f"{combined}\n\n--- TEXTRACT ---\n{textract_text}"
+    elif textract_text and pdf_text:
+        combined = textract_text
+        if pdf_text.strip() not in textract_text:
+            combined = f"{textract_text}\n\n--- PDF_TEXT ---\n{pdf_text.strip()}"
+    else:
+        combined = textract_text or pdf_text.strip()
+
+    ocr["raw_text"] = combined
+    # Re-parse demographics from the fullest text we have.
+    if combined:
+        fill_demo = _parse_demographics_from_lines_safe(combined)
+        for key, val in fill_demo.items():
+            if val and not str(ocr.get(key) or "").strip():
+                ocr[key] = val
+    return ocr
+
+
+def _parse_demographics_from_lines_safe(text: str) -> Dict[str, str]:
+    try:
+        from app.services.textract_ocr import _parse_demographics_from_lines
+
+        return _parse_demographics_from_lines(text.splitlines())
+    except Exception:
+        logger.exception("demographics parse from complete extract failed")
+        return {}
+
+
+def _seed_data_from_extract(
+    ocr: Dict[str, str],
+    category_hint: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build an initial OpenAI-shaped payload from complete extract (before mapping)."""
+    hint = normalize_document_name_hint(category_hint) or "other"
+    patient = str(ocr.get("patient_name") or "")
+    clinic = str(ocr.get("clinic_hospital_name") or ocr.get("provider_name") or "")
+    doctor = str(ocr.get("doctor_name") or "")
+    age = str(ocr.get("patient_age") or "")
+    gender = str(ocr.get("patient_gender") or "")
+    consult = str(ocr.get("consultation_date") or "")
+    data: Dict[str, Any] = {
+        "document_type": "uncertain",
+        "content_handwritten_percent": 50.0,
+        "content_computer_generated_percent": 50.0,
+        "is_medical_document": hint != "payment_receipt" and hint != "other",
+        "document_category": hint if hint in _VALID_CATEGORIES else "other",
+        "invoice_subtype": "uncertain" if hint == "invoice" else "not_applicable",
+        "prescription_subtype": "uncertain" if hint == "prescription" else "not_applicable",
+        "non_medical_reason": "",
+        "prescription_parameters": {
+            "patient_name": patient,
+            "patient_age": age,
+            "patient_gender": gender,
+            "doctor_name": doctor,
+            "clinic_hospital_name": clinic,
+            "consultation_date": consult,
+            "diagnosis": str(ocr.get("diagnosis") or ""),
+            "visual_acuity_details": str(ocr.get("visual_acuity_details") or ""),
+        },
+        "invoice_parameters": {
+            "patient_name": patient,
+            "patient_age": age,
+            "patient_gender": gender,
+            "doctor_name": doctor,
+            "provider_name": clinic or str(ocr.get("provider_name") or ""),
+            "provider_address": str(ocr.get("provider_address") or ""),
+            "provider_contact": str(ocr.get("provider_contact") or ""),
+            "invoice_number": str(ocr.get("invoice_number") or ""),
+            "invoice_date": str(ocr.get("invoice_date") or ""),
+            "total_amount": str(ocr.get("total_amount") or ""),
+            "gst_number": str(ocr.get("gst_number") or ""),
+            "drug_license_number": str(ocr.get("drug_license_number") or ""),
+        },
+        "report_parameters": {
+            "patient_name": patient,
+            "patient_age": age,
+            "patient_gender": gender,
+            "laboratory_name": clinic,
+        },
+        "payment_receipt_parameters": {
+            "payment_mode": str(ocr.get("payment_mode") or ""),
+            "payment_amount": str(ocr.get("payment_amount") or ""),
+            "transaction_date": str(ocr.get("transaction_date") or ""),
+            "transaction_id": str(ocr.get("transaction_id") or ""),
+            "reference_number": str(ocr.get("reference_number") or ""),
+            "utr": str(ocr.get("utr") or ""),
+            "payer_name": str(ocr.get("payer_name") or ""),
+            "payee_name": str(ocr.get("payee_name") or ""),
+            "upi_id": str(ocr.get("upi_id") or ""),
+            "bank_name": str(ocr.get("bank_name") or ""),
+            "payment_status": str(ocr.get("payment_status") or ""),
+            "payment_time": str(ocr.get("payment_time") or ""),
+            "account_number_masked": str(ocr.get("account_number_masked") or ""),
+            "ifsc": str(ocr.get("ifsc") or ""),
+            "remarks": str(ocr.get("remarks") or ""),
+        },
+        "parameters": {
+            "patient_name": patient,
+            "doctor_name": doctor,
+            "clinic_hospital_name": clinic,
+            "provider_name": clinic,
+        },
+    }
+    return data
+
+
 def classify_document_url_openai(
     url: str,
     category_hint: Optional[str] = None,
     extract_fields: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    """Hybrid classify: Textract OCR + OpenAI Vision in parallel, then merge.
-
-    category_hint: optional CRM label (invoice / prescription / report / payment_receipt).
-    extract_fields: optional subset of parameter keys — slimmer schema, faster extraction.
-    Optional Vision GST/stamp refine is off by default (OPENAI_REFINE_PASSES).
+    """Strict flow:
+      1) EXTRACT complete data from PDF/image (Textract + PDF text)
+      2) ANALYZE + MAP that extract into API parameters (OpenAI)
+      3) Attach page image only if extract is weak (handwriting/logo gaps)
     """
     started = time.perf_counter()
     model = (os.getenv("OPENAI_MODEL") or DEFAULT_MODEL).strip()
@@ -3635,49 +3884,59 @@ def classify_document_url_openai(
     t_load = time.perf_counter()
     hint = normalize_document_name_hint(category_hint)
     fields = normalize_extract_fields(extract_fields)
-    run_textract = use_textract_for_category_hint(hint)
 
-    ocr: Dict[str, str] = {}
-    if run_textract:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            fut_ocr = pool.submit(_run_textract_ocr, doc)
-            fut_ai = pool.submit(
-                _call_openai_vision,
-                client,
-                model,
-                image_blocks,
-                hint or None,
-                fields,
-            )
-            ocr = fut_ocr.result() or {}
-            data = fut_ai.result()
-    else:
-        data = _call_openai_vision(
-            client, model, image_blocks, hint or None, fields
-        )
+    # ── STEP 1: EXTRACT complete data from the document ─────────────────────
+    ocr = _extract_complete_document_data(doc)
+    t_ocr = time.perf_counter()
+    seeded = _seed_data_from_extract(ocr, hint or None)
+
+    # ── STEP 2: ANALYZE extract + MAP into API parameters ───────────────────
+    mapped = _call_openai_vision(
+        client,
+        model,
+        image_blocks,
+        hint or None,
+        fields,
+        ocr=ocr,
+    )
     t_main = time.perf_counter()
+
+    # Prefer mapped values; keep extract-seeded values where OpenAI left blanks.
+    data = seeded
+    for key, val in mapped.items():
+        if key.endswith("_parameters") and isinstance(val, dict):
+            bucket = dict(data.get(key) or {})
+            for field, fval in val.items():
+                if isinstance(fval, list):
+                    if fval:
+                        bucket[field] = fval
+                elif str(fval or "").strip():
+                    bucket[field] = fval
+            data[key] = bucket
+        elif key == "parameters" and isinstance(val, dict):
+            bucket = dict(data.get("parameters") or {})
+            for field, fval in val.items():
+                if isinstance(fval, list):
+                    if fval:
+                        bucket[field] = fval
+                elif str(fval or "").strip():
+                    bucket[field] = fval
+            data[key] = bucket
+        else:
+            data[key] = val
 
     if hint:
         _apply_category_hint(data, hint)
     else:
         _recover_medical_classification(data)
-    if ocr:
-        merge_textract_into_openai_data(data, ocr)
-        fill_demographics_from_text(data, ocr.get("raw_text") or "")
-        if hint:
-            _apply_category_hint(data, hint)
-        else:
-            _recover_medical_classification(data)
 
-    if doc.is_pdf:
-        try:
-            pdf_text = extract_pdf_text(doc.raw, max_pages=pdf_vision_max_pages())
-        except Exception:
-            logger.exception("PDF text extract failed for %s", url)
-            pdf_text = ""
-        if pdf_text:
-            _fill_labeled_dates_from_text(data, pdf_text)
-            fill_demographics_from_text(data, pdf_text)
+    # Extract remains source of truth for empty gaps after mapping.
+    merge_textract_into_openai_data(data, ocr)
+    fill_demographics_from_text(data, ocr.get("raw_text") or "")
+    if hint:
+        _apply_category_hint(data, hint)
+    else:
+        _recover_medical_classification(data)
 
     refine_ms = 0.0
     if _OPENAI_REFINE_PASSES:
@@ -3702,11 +3961,10 @@ def classify_document_url_openai(
             logger.exception("Doctor registration stamp pass failed for %s", url)
         refine_ms = (time.perf_counter() - t_refine0) * 1000.0
 
-        if ocr:
-            merge_textract_into_openai_data(data, ocr)
-            fill_demographics_from_text(data, ocr.get("raw_text") or "")
-            if hint:
-                _apply_category_hint(data, hint)
+        merge_textract_into_openai_data(data, ocr)
+        fill_demographics_from_text(data, ocr.get("raw_text") or "")
+        if hint:
+            _apply_category_hint(data, hint)
 
     sync_patient_name_across_buckets(data)
     result = _build_public_response(
@@ -3714,13 +3972,20 @@ def classify_document_url_openai(
     )
     total_ms = (time.perf_counter() - started) * 1000.0
     result["processing_time_ms"] = round(total_ms, 1)
+    result["ocr_weak"] = _ocr_is_weak(ocr, hint or None)
+    result["used_vision"] = bool(_ocr_is_weak(ocr, hint or None) and image_blocks)
+    result["extract_chars"] = len(_ocr_raw_text(ocr))
     logger.info(
-        "classify_document url=%s hint=%s textract=%s load_ms=%.0f main_ms=%.0f refine_ms=%.0f total_ms=%.0f",
+        "classify_document url=%s hint=%s extract_chars=%s ocr_weak=%s vision=%s "
+        "load_ms=%.0f extract_ms=%.0f map_ms=%.0f refine_ms=%.0f total_ms=%.0f",
         url.split("/")[-1],
         hint or "-",
-        run_textract,
+        result["extract_chars"],
+        result["ocr_weak"],
+        result["used_vision"],
         (t_load - started) * 1000.0,
-        (t_main - t_load) * 1000.0,
+        (t_ocr - t_load) * 1000.0,
+        (t_main - t_ocr) * 1000.0,
         refine_ms,
         total_ms,
     )
