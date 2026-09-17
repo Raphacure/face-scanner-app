@@ -30,7 +30,9 @@ from app.services.document_image_fetch import (
 )
 from app.services.textract_ocr import (
     extract_textract_fields,
+    fill_demographics_from_text,
     merge_textract_into_openai_data,
+    sync_patient_name_across_buckets,
 )
 
 logger = logging.getLogger(__name__)
@@ -597,11 +599,18 @@ Optional: payment_time, account_number_masked, ifsc, remarks.
 prescription_subtype: opd | pharmacy | diagnostic | dental | eye_care | uncertain | not_applicable
 Common: patient_*, consultation_date, clinic_hospital_*, doctor_name/qualification/registration_number,
 doctor_signature/stamp, diagnosis, presenting_complaints, line_of_treatment, followup_*.
+patient_name (OPD/clinic pads): read the handwritten name after printed "Name :" / "Patient Name :" /
+"Patient :" (top demographics row). Indian Rx pads often label only "Name :" — that IS patient_name.
+Do not leave patient_name empty when handwriting is present on that line — even if Age/Sex is blank,
+and even if the cursive name sits slightly above/beside the printed "Name :" dots.
+Never put the hospital or doctor name into patient_name.
 doctor_name: from letterhead or Prescribed by. Transliterate regional scripts to English when visible.
 Use "" if the name is not printed or not readable — plain text only, no placeholders.
 clinic_hospital_name: from letterhead logo / hospital title (top of Rx). If printed only in a
-regional script, transliterate to English. Prefer English brand/logo text when both are present.
-Never leave clinic_hospital_name empty when a hospital/clinic name is printed on the letterhead.
+regional script, transliterate to English. Prefer English brand/logo text when both are present
+(e.g. Tamil "ஸ்ரீ மருத்துவமனை" + logo "SRI HOSPITALS" → "SRI HOSPITALS").
+Never leave clinic_hospital_name empty when a hospital/clinic name is printed on the letterhead —
+including circular logos where HOSPITALS is stacked under the brand (SRI / HOSPITALS).
 - opd/pharmacy: prescribed_medicines[{medicine,dosage}]; advised_tests if labs
 - diagnostic: advised_tests[]; dental: tooth/treatment/procedure; eye: VA/power/glasses
 eye_care / OPD SUMMARY / refraction sheets — extract EVERY visible clinical field:
@@ -642,12 +651,16 @@ Map visible labels onto the requested keys. Do not invent values.
 Dates as YYYY-MM-DD when possible. Signatures/stamps: "present" if visible but illegible.
 Handwritten vs computer_generated percents must sum to 100.
 doctor_name / clinic_hospital_name: read letterhead (top of page). If only a regional script is
-printed, transliterate to English. Prefer English logo/brand text when both exist. Use "" only if
-truly not printed — never skip because the letterhead is non-Latin.
+printed, transliterate to English (Tamil மருத்துவமனை/கிளினிக், Hindi अस्पताल/क्लिनिक, etc.).
+Prefer English logo/brand text when both exist (stacked logo lines like SRI + HOSPITALS count).
+Use "" only if truly not printed — never skip because the letterhead is non-Latin.
 invoice_number: Bill/Invoice/Receipt/Inv/Memo No, regional बिल/रसीद/पावती/क्रमांक labels, OR an
 unlabeled printed serial in the receipt header/top-right (common on OPD fee forms). That serial
 is invoice_number — do not leave it empty when visible.
 Pharmacy / cash memo labels: patient_name = "Prescribed for" / Patient / Name / नाव; doctor_name = "By Dr" / Doctor.
+OPD Rx pads: patient_name = handwritten value on the printed "Name :" / "Patient Name :" /
+"Patient :" line (often beside Age/Sex and Date). Do not leave patient_name empty when that
+line has a handwritten name — even if Age/Sex is blank. Never use the doctor or hospital name.
 Do not confuse "Prescribed for" (patient) with "By Dr" (doctor). Use "" only when truly absent.
 Text fields use "" when absent — never "present" (only doctor_signature / doctor_stamp use "present").
 """
@@ -882,13 +895,20 @@ def _build_slim_document_schema(fields: Sequence[str]) -> Dict[str, Any]:
 
 
 def use_textract_for_category_hint(hint: str) -> bool:
-    """When CRM sends name, skip Textract except for invoices (saves ~15–30s per file)."""
+    """Run Textract for medical docs that carry patient demographics.
+
+    CRM hints used to skip Textract for prescriptions (speed), but OpenAI-only
+    often leaves handwritten patient_name empty → upstream \"missing\" rejects.
+    """
     if not textract_enabled():
         return False
     normalized = normalize_document_name_hint(hint)
     if not normalized:
         return True
-    only_invoice = (os.getenv("TEXTRACT_HINT_INVOICE_ONLY") or "true").strip().lower() in (
+    # Always OCR Rx / invoice / lab — patient_name and letterhead live here.
+    if normalized in {"prescription", "invoice", "report"}:
+        return True
+    only_invoice = (os.getenv("TEXTRACT_HINT_INVOICE_ONLY") or "false").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -1706,6 +1726,59 @@ def _completeness(
     filled = total - len(missing)
     pct = round(filled / total * 100.0, 2) if total else 0.0
     return pct, missing
+
+
+def _promote_field_aliases(params: Dict[str, Any]) -> None:
+    """Fill empty twin fields from aliases so returned JSON and missing stay consistent."""
+    facility = (
+        _str_val(params.get("clinic_hospital_name"))
+        or _str_val(params.get("provider_name"))
+        or _str_val(params.get("laboratory_name"))
+    )
+    if facility:
+        if not _is_meaningful_string(params.get("clinic_hospital_name")):
+            params["clinic_hospital_name"] = facility
+        if not _is_meaningful_string(params.get("provider_name")):
+            params["provider_name"] = facility
+        if not _is_meaningful_string(params.get("laboratory_name")):
+            params["laboratory_name"] = facility
+
+    address = (
+        _str_val(params.get("clinic_hospital_address"))
+        or _str_val(params.get("provider_address"))
+        or _str_val(params.get("laboratory_address"))
+    )
+    if address:
+        if not _is_meaningful_string(params.get("clinic_hospital_address")):
+            params["clinic_hospital_address"] = address
+        if not _is_meaningful_string(params.get("provider_address")):
+            params["provider_address"] = address
+        if not _is_meaningful_string(params.get("laboratory_address")):
+            params["laboratory_address"] = address
+
+    # Stamp/signature often land in only one bucket.
+    if _is_filled(params, "authorized_stamp") and not _is_filled(params, "doctor_stamp"):
+        params["doctor_stamp"] = params.get("authorized_stamp")
+    if _is_filled(params, "doctor_stamp") and not _is_filled(params, "authorized_stamp"):
+        params["authorized_stamp"] = params.get("doctor_stamp")
+    if _is_filled(params, "authorized_signature") and not _is_filled(
+        params, "doctor_signature"
+    ):
+        params["doctor_signature"] = params.get("authorized_signature")
+    if _is_filled(params, "doctor_signature") and not _is_filled(
+        params, "authorized_signature"
+    ):
+        params["authorized_signature"] = params.get("doctor_signature")
+
+
+def _reconcile_missing_parameters(
+    params: Dict[str, Any],
+    required: Sequence[str],
+    extra_checks: Sequence[Tuple[str, bool]],
+) -> Tuple[float, List[str]]:
+    """Compute missing from the exact parameters map we return to CRM."""
+    _promote_field_aliases(params)
+    return _completeness(params, required, extra_checks)
 
 
 def _provider_blob(params: Dict[str, Any]) -> str:
@@ -2813,6 +2886,9 @@ def _build_public_response(
     category_hint: Optional[str] = None,
     extract_fields: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
+    # patient_name in any bucket must be visible before completeness runs.
+    sync_patient_name_across_buckets(data)
+
     hint = normalize_document_name_hint(category_hint)
     response_name = request_name_for_response(category_hint)
     if hint:
@@ -2828,7 +2904,8 @@ def _build_public_response(
         doc_type = _apply_document_type(data)
         content_hw, content_cg = _content_percent_split(data)
         parameters = _parameters_from_extraction(data, extract_fields)
-        completeness, missing_parameters = _completeness(
+        _promote_field_aliases(parameters)
+        completeness, missing_parameters = _reconcile_missing_parameters(
             parameters, extract_fields, ()
         )
         invoice_subtype = str(data.get("invoice_subtype") or "not_applicable")
@@ -2973,6 +3050,20 @@ def _build_public_response(
     _normalize_payment_receipt_fields(pay_params)
     data["payment_receipt_parameters"] = pay_params
 
+    # After normalize, copy patient_name into every bucket again.
+    sync_patient_name_across_buckets(data)
+    rx_params = _normalize_params(
+        data.get("prescription_parameters"),
+        PRESCRIPTION_PARAM_KEYS,
+        _PRESCRIPTION_ARRAY_KEYS,
+    )
+    inv_params = _normalize_params(
+        data.get("invoice_parameters"), INVOICE_PARAM_KEYS, _INVOICE_ARRAY_KEYS
+    )
+    rep_params = _normalize_params(
+        data.get("report_parameters"), REPORT_PARAM_KEYS, _REPORT_ARRAY_KEYS
+    )
+
     if category == "payment_receipt":
         parameters = pay_params
         extra_checks = _payment_receipt_extra_checks(parameters)
@@ -2984,12 +3075,17 @@ def _build_public_response(
         unified = _merge_claim_field_buckets(
             parameters, rx_params, inv_params, rep_params
         )
+        _promote_field_aliases(unified)
         check_params = unified if extract_fields else parameters
-        completeness, missing_parameters = _completeness(
-            check_params,
+        if not extract_fields:
+            _promote_field_aliases(check_params)
+        completeness, missing_parameters = _reconcile_missing_parameters(
+            check_params if extract_fields else unified,
             required_fields,
             tuple(extra_checks) if not extract_fields else (),
         )
+        # Always return unified with aliases promoted.
+        _promote_field_aliases(unified)
         return _with_request_name(
             {
                 "url": url,
@@ -3021,32 +3117,12 @@ def _build_public_response(
                 prescription_subtype, PRESCRIPTION_REQUIRED
             )
         )
-        extra_checks = (
-            ()
-            if extract_fields
-            else _prescription_subtype_extra_checks(prescription_subtype, parameters)
-        )
-        completeness, missing_parameters = _completeness(
-            parameters,
-            required,
-            tuple(extra_checks),
-        )
     elif category == "invoice":
         parameters = inv_params
         invoice_subtype = _infer_invoice_subtype(
             parameters, str(data.get("invoice_subtype", "uncertain"))
         )
-        extra_checks = (
-            ()
-            if extract_fields
-            else _invoice_subtype_extra_checks(invoice_subtype, parameters)
-        )
         required = tuple(extract_fields) if extract_fields else INVOICE_REQUIRED
-        completeness, missing_parameters = _completeness(
-            parameters,
-            required,
-            tuple(extra_checks),
-        )
     else:
         parameters = rep_params
         _fix_report_content_classification(data, parameters)
@@ -3056,11 +3132,27 @@ def _build_public_response(
         doc_type = _apply_document_type(data)
         content_hw, content_cg = _content_percent_split(data)
         required = tuple(extract_fields) if extract_fields else REPORT_REQUIRED
-        completeness, missing_parameters = _completeness(parameters, required, ())
 
     # Surface every filled field from all buckets — classification does not hide values.
     unified = _merge_claim_field_buckets(
         rx_params, inv_params, rep_params, pay_params, parameters
+    )
+    _promote_field_aliases(unified)
+
+    # Extra checks MUST run on unified (not a single empty category bucket).
+    if extract_fields:
+        extra_checks: Sequence[Tuple[str, bool]] = ()
+    elif category == "prescription":
+        extra_checks = _prescription_subtype_extra_checks(
+            prescription_subtype, unified
+        )
+    elif category == "invoice":
+        extra_checks = _invoice_subtype_extra_checks(invoice_subtype, unified)
+    else:
+        extra_checks = ()
+
+    completeness, missing_parameters = _reconcile_missing_parameters(
+        unified, required, tuple(extra_checks)
     )
 
     return _with_request_name(
@@ -3261,7 +3353,8 @@ def _call_openai_vision(
         ):
             rx_note = (
                 " RX LETTERHEAD: clinic_hospital_name = hospital/clinic title or logo "
-                "(transliterate regional scripts to English; prefer English brand if present); "
+                "(transliterate regional scripts to English; prefer English brand if present; "
+                "stacked logo text like SRI + HOSPITALS → \"SRI HOSPITALS\"); "
                 "doctor_name = full printed name or \"\"; "
                 "doctor_registration_number = Regn no / Reg No / WBMC/MCI (number only); "
                 "doctor_signature = \"present\" if a handwritten signature is visible; "
@@ -3272,7 +3365,9 @@ def _call_openai_vision(
             inv_note = (
                 " CASH MEMO / PHARMACY: patient_name = handwritten name after "
                 "\"Prescribed for\" / Patient / Name / नाव; doctor_name = after \"By Dr\" / Doctor. "
-                "These are different fields — fill both when both lines have handwriting."
+                "OPD Rx pads: patient_name = handwriting after printed \"Name :\" / "
+                "\"Patient Name :\" / \"Patient :\". These are different fields — fill both "
+                "when both lines have handwriting."
             )
         if "invoice_number" in field_list:
             inv_note += (
@@ -3568,6 +3663,7 @@ def classify_document_url_openai(
         _recover_medical_classification(data)
     if ocr:
         merge_textract_into_openai_data(data, ocr)
+        fill_demographics_from_text(data, ocr.get("raw_text") or "")
         if hint:
             _apply_category_hint(data, hint)
         else:
@@ -3581,6 +3677,7 @@ def classify_document_url_openai(
             pdf_text = ""
         if pdf_text:
             _fill_labeled_dates_from_text(data, pdf_text)
+            fill_demographics_from_text(data, pdf_text)
 
     refine_ms = 0.0
     if _OPENAI_REFINE_PASSES:
@@ -3607,9 +3704,11 @@ def classify_document_url_openai(
 
         if ocr:
             merge_textract_into_openai_data(data, ocr)
+            fill_demographics_from_text(data, ocr.get("raw_text") or "")
             if hint:
                 _apply_category_hint(data, hint)
 
+    sync_patient_name_across_buckets(data)
     result = _build_public_response(
         url, data, category_hint=hint or None, extract_fields=fields
     )
@@ -3644,8 +3743,8 @@ def _refresh_prescription_result_completeness(result: Dict[str, Any]) -> None:
     else:
         subtype = str(result.get("prescription_subtype") or "opd")
         required = PRESCRIPTION_SUBTYPE_REQUIRED.get(subtype, PRESCRIPTION_REQUIRED)
-        extra = _prescription_subtype_extra_checks(subtype, params)
-    completeness, missing = _completeness(params, required, extra)
+        extra = tuple(_prescription_subtype_extra_checks(subtype, params))
+    completeness, missing = _reconcile_missing_parameters(params, required, extra)
     result["completeness_percent"] = completeness
     result["missing_parameters"] = missing
 
