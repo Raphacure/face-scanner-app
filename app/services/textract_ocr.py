@@ -68,9 +68,23 @@ _TOTAL_RE = re.compile(
     r"([\d,]+\.?\d*)",
     re.IGNORECASE,
 )
+# Age then gender: "25 Years / Female". Gender then age (Practo): "Female, 25 Years".
 _AGE_SEX_RE = re.compile(
+    r"(?:"
     r"((?:\d{1,3})\s*(?:years?|yrs?|y)?(?:\s*\d+\s*months?)?)\s*[/\-,]?\s*"
-    r"(male|female|m|f)\b",
+    r"(male|female|m|f)\b"
+    r"|"
+    r"\b(male|female|m|f)\b\s*[,/\-]?\s*"
+    r"((?:\d{1,3})\s*(?:years?|yrs?|y)(?:\s*\d+\s*months?)?)"
+    r")",
+    re.IGNORECASE,
+)
+_GENDER_AGE_LINE_RE = re.compile(
+    r"^(?:male|female|m|f)\b\s*[,/\-]?\s*\d{1,3}\s*(?:years?|yrs?|y)\b",
+    re.IGNORECASE,
+)
+_AGE_GENDER_LINE_RE = re.compile(
+    r"^\d{1,3}\s*(?:years?|yrs?|y)?\s*[/\-,]?\s*(?:male|female|m|f)\b",
     re.IGNORECASE,
 )
 _DOCTOR_LINE_RE = re.compile(
@@ -137,9 +151,11 @@ _NON_PERSON_NAME_TOKENS = frozenset(
         "opd",
     }
 )
+# Pharmacy "By Dr X" and OPD invoice line items "Consultation by Dr SRAVYA 400.00".
 _BY_DR_RE = re.compile(
-    r"By\s*Dr\.?\s*[:.\-\s]*([A-Za-z][A-Za-z.'\s]{1,60}?)"
-    r"(?=\s*(?:Date|No\.?\b|Particular|Prescribed|Age|Sex|$|\n))",
+    r"(?:Consultation\s+)?By\s*Dr\.?\s*[:.\-\s]*([A-Za-z][A-Za-z.'\s]{1,60}?)"
+    r"(?=\s*(?:Date|No\.?\b|Particular|Prescribed|Age|Sex|"
+    r"[\d,]+\.?\d*|₹|Rs\.?|INR|$|\n))",
     re.IGNORECASE,
 )
 _FACILITY_LINE_RE = re.compile(
@@ -461,6 +477,13 @@ def _clean_patient_name_value(raw: str) -> str:
     name = (raw or "").strip(" .:-")
     if not name:
         return ""
+    # Practo / HIS: "N. DURGA SHALINI (P38972)" — drop trailing patient/MRN id.
+    name = re.sub(
+        r"\s*\((?:P|MR|UHID|PID|ID|PT)?[\s#:\-]*[A-Z0-9\-]+\)\s*$",
+        "",
+        name,
+        flags=re.IGNORECASE,
+    ).strip(" .:-")
     name = _PATIENT_NAME_STOP_RE.sub("", name).strip(" .:-")
     # Reject non-name leftovers (dates, amounts, single tokens that are labels).
     if not name or re.fullmatch(r"[\d./\-]+", name):
@@ -533,6 +556,35 @@ def _orphan_patient_name_near_demographics(lines: List[str]) -> str:
     if found:
         return found
     return _scan(range(name_idx + 1, min(len(lines), name_idx + 5)))
+
+
+def _orphan_patient_name_near_gender_age(lines: List[str]) -> str:
+    """Practo / OPD payments: unlabeled name just above 'Female, 25 Years'."""
+    for idx, line in enumerate(lines):
+        raw = line.strip()
+        if not raw:
+            continue
+        if not (_GENDER_AGE_LINE_RE.match(raw) or _AGE_GENDER_LINE_RE.match(raw)):
+            continue
+        for j in range(idx - 1, max(-1, idx - 4), -1):
+            cand = lines[j].strip()
+            if not cand:
+                continue
+            # Skip letterhead / regulatory / section headers above the name.
+            if re.match(
+                r"^(?:GST|Drug|Licence|License|Phone|Ph\.?\s*n|Tel|Mobile|Plot|"
+                r"Payments?|Receipt|Invoice|Address|Generated|Powered|"
+                r"Treatments?|Hospital|Clinic)\b",
+                cand,
+                re.IGNORECASE,
+            ):
+                continue
+            if _HOSPITALISH_NAME_RE.search(cand):
+                continue
+            cleaned = _clean_patient_name_value(cand)
+            if cleaned and _looks_like_person_name(cleaned):
+                return cleaned
+    return ""
 
 
 def _append_patient_name_continuation(lines: List[str], patient: str) -> str:
@@ -617,8 +669,12 @@ def _parse_demographics_from_lines(lines: List[str]) -> Dict[str, str]:
 
     age_sex = _AGE_SEX_RE.search(text)
     if age_sex:
-        out["patient_age"] = age_sex.group(1).strip()
-        gender = age_sex.group(2).strip().upper()
+        if age_sex.group(1) and age_sex.group(2):
+            out["patient_age"] = age_sex.group(1).strip()
+            gender = age_sex.group(2).strip().upper()
+        else:
+            out["patient_age"] = (age_sex.group(4) or "").strip()
+            gender = (age_sex.group(3) or "").strip().upper()
         out["patient_gender"] = (
             "F" if gender.startswith("F") else "M" if gender.startswith("M") else gender
         )
@@ -652,6 +708,8 @@ def _parse_demographics_from_lines(lines: List[str]) -> Dict[str, str]:
     patient = _clean_patient_name_value(patient)
     if not patient:
         patient = _orphan_patient_name_near_demographics(lines)
+    if not patient:
+        patient = _orphan_patient_name_near_gender_age(lines)
     if patient:
         patient = _append_patient_name_continuation(lines, patient)
         out["patient_name"] = patient
