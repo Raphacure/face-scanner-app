@@ -584,6 +584,10 @@ Pharmacy cash memo / chemist bill: patient_name = handwritten value after "Presc
 (not the doctor). doctor_name = value after "By Dr" / "Dr.". Do not leave patient_name empty
 when "Prescribed for" has a handwritten name. Regional patient labels (नाव / Name) also map to
 patient_name; date labels (दिनांक / Date) to invoice_date.
+Practo / HIS OPD payment receipts: patient_name is often unlabeled — the bold person name
+above "Female/Male, N Years" (may include "(P38972)" patient id — strip the id, keep the name).
+doctor_name may appear only in line items as "Consultation by Dr SRAVYA" — extract "Dr SRAVYA".
+Do not leave patient_name or doctor_name empty when those patterns are visible.
 Pharmacy: drug_license_number (all DL lines, join "; "); medicine_details[] "name | Qty | Rate | Batch | Exp".
 OPD: consultation_charges, registration_charges, service_details[].
 Diagnostic: sample_collection_date (Registered On / Collected On / Received On), test_details[] "Test — Rs amt".
@@ -666,6 +670,8 @@ Pharmacy / cash memo labels: patient_name = "Prescribed for" / Patient / Name / 
 OPD Rx pads: patient_name = handwritten value on the printed "Name :" / "Patient Name :" /
 "Patient :" line (often beside Age/Sex and Date). Do not leave patient_name empty when that
 line has a handwritten name — even if Age/Sex is blank. Never use the doctor or hospital name.
+Practo / HIS OPD invoices: unlabeled person name above "Female/Male, N Years" IS patient_name
+(strip "(P…)" / MRN suffixes). "Consultation by Dr NAME" in Treatments IS doctor_name.
 Do not confuse "Prescribed for" (patient) with "By Dr" (doctor). Use "" only when truly absent.
 Text fields use "" when absent — never "present" (only doctor_signature / doctor_stamp use "present").
 """
@@ -1134,6 +1140,7 @@ def _normalize_doctor_name_value(params: Dict[str, Any]) -> None:
         params["doctor_name"] = ""
         return
     name = re.sub(r"^(?:prescribed\s*by\s*:?\s*)", "", name, flags=re.I)
+    name = re.sub(r"^(?:consultation\s+by\s*:?\s*)", "", name, flags=re.I)
     name = name.strip("() ").strip()
     name = re.sub(r"\s+", " ", name)
     params["doctor_name"] = name
@@ -3451,8 +3458,10 @@ def _call_openai_vision(
                 " CASH MEMO / PHARMACY: patient_name = handwritten name after "
                 "\"Prescribed for\" / Patient / Name / नाव; doctor_name = after \"By Dr\" / Doctor. "
                 "OPD Rx pads: patient_name = handwriting after printed \"Name :\" / "
-                "\"Patient Name :\" / \"Patient :\". These are different fields — fill both "
-                "when both lines have handwriting."
+                "\"Patient Name :\" / \"Patient :\". "
+                "PRACTO / HIS OPD PAYMENT: unlabeled person name above \"Female/Male, N Years\" "
+                "IS patient_name (strip \"(P…)\" ids); \"Consultation by Dr NAME\" in Treatments "
+                "IS doctor_name. Fill both when visible."
             )
         if "invoice_number" in field_list:
             inv_note += (
