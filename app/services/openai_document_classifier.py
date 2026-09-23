@@ -574,6 +574,9 @@ invoice_subtype: pharmacy | diagnostic | opd_consultation | dental | eye_care | 
 
 INVOICE: patient_*, invoice_number/date, provider_*, doctor_name, total_amount (digits only, primary total),
 payment_mode, transaction_reference, authorized_stamp/signature.
+total_amount: read the primary billed/paid figure — "Total", "Grand Total", "Rs. 600/-", "₹600",
+"600/-" on cash memos, or the amount on an attached UPI/GPay screenshot. Digits only (600 not Rs. 600/-).
+Multi-page packs: page 1 may be Rx/OPD notes; the RECEIPT / fee amount is often on a later page — still fill total_amount.
 invoice_number: Bill No / Invoice No / Receipt No / Inv No / Memo No, OR regional labels
 (बिल नं / रसीद नं / पावती नं / क्रमांक / नं.). Hospital/OPD fee receipts often print only a
 serial number in the top-right / header with no English label — that printed serial IS
@@ -611,6 +614,10 @@ patient_name (OPD/clinic pads): read the handwritten name after printed "Name :"
 Do not leave patient_name empty when handwriting is present on that line — even if Age/Sex is blank,
 and even if the cursive name sits slightly above/beside the printed "Name :" dots.
 Never put the hospital or doctor name into patient_name.
+consultation_date (OPD/hospital pads): read the handwritten date on/above/beside printed "DATE" /
+"DATE........" / Visit Date (often top-left demographics, e.g. 22/9/26 or 22/9/2026). Do NOT leave
+consultation_date empty when that handwriting is visible — even if the printed DATE line has only dots.
+Normalize to YYYY-MM-DD (2-digit years → 20xx). Never use DOB as consultation_date.
 doctor_name: from letterhead or Prescribed by. Transliterate regional scripts to English when visible.
 Use "" if the name is not printed or not readable — plain text only, no placeholders.
 clinic_hospital_name: from letterhead logo / hospital title (top of Rx). If printed only in a
@@ -670,6 +677,8 @@ Pharmacy / cash memo labels: patient_name = "Prescribed for" / Patient / Name / 
 OPD Rx pads: patient_name = handwritten value on the printed "Name :" / "Patient Name :" /
 "Patient :" line (often beside Age/Sex and Date). Do not leave patient_name empty when that
 line has a handwritten name — even if Age/Sex is blank. Never use the doctor or hospital name.
+consultation_date on OPD/hospital pads: handwritten date on/above/beside printed "DATE" /
+"DATE........" (e.g. 22/9/26) — normalize YYYY-MM-DD; do not leave empty when visible.
 Practo / HIS OPD invoices: unlabeled person name above "Female/Male, N Years" IS patient_name
 (strip "(P…)" / MRN suffixes). "Consultation by Dr NAME" in Treatments IS doctor_name.
 Do not confuse "Prescribed for" (patient) with "By Dr" (doctor). Use "" only when truly absent.
@@ -934,12 +943,18 @@ def _ocr_is_weak(ocr: Optional[Dict[str, str]], category_hint: Optional[str] = N
         or str(ocr.get("provider_name") or "").strip()
     )
     doctor = str(ocr.get("doctor_name") or "").strip()
-    # Prescription/OPD: need vision if patient or hospital letterhead still missing.
+    consult = str(ocr.get("consultation_date") or "").strip()
+    total_amount = str(ocr.get("total_amount") or "").strip()
+    # Prescription/OPD: need vision if patient, hospital, or handwritten visit date missing.
+    # Hospital pads often have strong printed OCR but a handwritten date above DATE ......
     if hint in {"prescription", "opd", ""}:
-        if not patient or not facility:
+        if not patient or not facility or not consult:
             return True
     elif hint == "invoice":
+        # OPD fee receipts often sit on page 2+ of Rx+receipt packs — amount must be present.
         if not patient and not facility:
+            return True
+        if not total_amount:
             return True
     elif hint == "report":
         if not patient:
@@ -1291,7 +1306,7 @@ _CONSULTATION_DATE_LABEL_RE = re.compile(
     r"|note\s*dt"
     r"|date\s*of\s*visit"
     r"|^date"
-    r")\s*[:\-]?\s*"
+    r")\s*[:.\-_]*\s*"
     + _DATE_VALUE_RE,
     re.IGNORECASE | re.MULTILINE,
 )
@@ -1392,6 +1407,35 @@ def _extract_consultation_date_from_text(text: str) -> str:
     labeled = _extract_labeled_date(text, _CONSULTATION_DATE_LABEL_RE)
     if labeled:
         return labeled
+    # Hospital OPD pads: handwritten value on the line above/below printed DATE ......
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for idx, line in enumerate(lines):
+        if not re.match(r"^Date\b", line, re.IGNORECASE):
+            continue
+        same = re.search(
+            r"\b(\d{1,2}[/|.\-]\d{1,2}[/|.\-]\d{2,4})\b",
+            line,
+        )
+        if same:
+            normalized = _normalize_to_iso_date(same.group(1))
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+                return normalized
+        for j in list(range(idx - 1, max(-1, idx - 4), -1)) + list(
+            range(idx + 1, min(len(lines), idx + 4))
+        ):
+            cand = lines[j]
+            if re.match(r"^(?:Name|Age|Sex|UHID|Time|Patient|Doctor)\b", cand, re.I):
+                continue
+            m = re.search(r"\b(\d{1,2}[/|.\-]\d{1,2}[/|.\-]\d{2,4})\b", cand)
+            if not m:
+                continue
+            if len(cand) > 28 and not re.fullmatch(
+                r"\d{1,2}[/|.\-]\d{1,2}[/|.\-]\d{2,4}", cand
+            ):
+                continue
+            normalized = _normalize_to_iso_date(m.group(1))
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+                return normalized
     header = _extract_header_document_date(text)
     if header:
         return header
@@ -1681,7 +1725,7 @@ def _invoice_gst_missing(inv: Dict[str, Any]) -> bool:
 
 
 def _normalize_total_amount(params: Dict[str, Any]) -> None:
-    """Strip labels from total_amount; keep numeric value only."""
+    """Strip labels/currency from total_amount; keep numeric value only (e.g. Rs. 600/- → 600)."""
     raw = _str_val(params.get("total_amount"))
     if not raw:
         return
@@ -1698,9 +1742,22 @@ def _normalize_total_amount(params: Dict[str, Any]) -> None:
     if labeled:
         params["total_amount"] = labeled.group(1).replace(",", "")
         return
+    # Indian cash memos: "Rs. 600/-", "₹600", "600/-"
+    currency = re.search(
+        r"(?:rs\.?|₹|inr)?\s*([0-9,]+(?:\.\d{1,2})?)\s*/?\-?\s*$",
+        clean,
+        re.IGNORECASE,
+    )
+    if currency:
+        params["total_amount"] = currency.group(1).replace(",", "")
+        return
     decimal = re.search(r"([0-9,]+\.\d{2})", raw)
     if decimal:
         params["total_amount"] = decimal.group(1).replace(",", "")
+    else:
+        digits = re.sub(r"[^\d.]", "", clean)
+        if digits and re.fullmatch(r"\d+(?:\.\d{1,2})?", digits):
+            params["total_amount"] = digits
 
 
 def _invoice_text_scan_blob(params: Dict[str, Any]) -> str:
@@ -3389,6 +3446,17 @@ def _pause_between_openai_calls() -> None:
         time.sleep(OPENAI_INTER_CALL_DELAY_MS / 1000.0)
 
 
+def _should_attach_vision_images(
+    image_blocks: List[Dict[str, Any]],
+    ocr: Optional[Dict[str, str]],
+    category_hint: Optional[str] = None,
+) -> bool:
+    """Always attach every page for multi-page PDFs; otherwise when OCR is weak."""
+    if len(image_blocks) > 1:
+        return True
+    return _ocr_is_weak(ocr, category_hint)
+
+
 def _call_openai_vision(
     client: Any,
     model: str,
@@ -3397,20 +3465,29 @@ def _call_openai_vision(
     extract_fields: Optional[Sequence[str]] = None,
     ocr: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
-    """Map OCR (+ optional image) into claim parameters.
+    """Map OCR (+ page images) into claim parameters.
 
-    Ideal flow: Textract extracts text first; OpenAI maps into parameters.
-    Images are attached only when OCR is weak (or always if OPENAI_ALWAYS_VISION).
+    Textract extracts text from every page first. OpenAI always receives all page
+    images for multi-page PDFs (Rx + receipt + UPI packs). Single-page images are
+    attached when OCR is weak (or always if OPENAI_ALWAYS_VISION).
     """
-    use_images = _ocr_is_weak(ocr, category_hint)
+    # Always read every page of a multi-page PDF — never gate on a missing field.
+    use_images = _should_attach_vision_images(image_blocks, ocr, category_hint)
     vision_blocks = image_blocks if use_images else []
     page_note = (
-        " Multiple pages attached — read all pages and merge extracted fields."
+        " Multiple pages attached — read ALL pages and merge extracted fields "
+        "(prescription, RECEIPT/cash memo, and payment screenshot if present)."
         if len(vision_blocks) > 1
         else ""
     )
     if use_images:
-        page_note += " Image(s) attached because OCR was weak or incomplete — use them."
+        page_note += " Image(s) attached — use them together with OCR."
+        if len(vision_blocks) > 1:
+            page_note += (
+                " Look for RECEIPT / cash memo / Rs. or ₹ totals and UPI payment screens "
+                "on later pages — put the billed/paid figure into invoice total_amount "
+                "(digits only)."
+            )
     else:
         page_note += " No image attached — map strictly from OCR_RAW_TEXT / OCR_STRUCTURED_HINTS."
 
@@ -3431,6 +3508,13 @@ def _call_openai_vision(
                 "IS sample_collection_date). "
                 "report_date = Reported On, Report Date, Date of Report, OR unlabeled top-of-page "
                 "study/report date (do not use Date of Birth). Use YYYY-MM-DD."
+            )
+        if "consultation_date" in field_list:
+            date_note += (
+                " CONSULTATION DATE: on OPD/hospital Rx pads read the handwritten date on, above, "
+                "or beside printed \"DATE\" / \"DATE........\" / Visit Date (e.g. 22/9/26). "
+                "Do not leave consultation_date empty when that handwriting is visible. "
+                "Normalize to YYYY-MM-DD (2-digit year → 20xx). Never use DOB."
             )
         rx_note = ""
         if any(
@@ -3881,9 +3965,9 @@ def classify_document_url_openai(
     extract_fields: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Strict flow:
-      1) EXTRACT complete data from PDF/image (Textract + PDF text)
+      1) EXTRACT complete data from every PDF/image page (Textract + PDF text)
       2) ANALYZE + MAP that extract into API parameters (OpenAI)
-      3) Attach page image only if extract is weak (handwriting/logo gaps)
+      3) Always attach all page images for multi-page PDFs; single-page only if OCR is weak
     """
     started = time.perf_counter()
     model = (os.getenv("OPENAI_MODEL") or DEFAULT_MODEL).strip()
@@ -3982,16 +4066,20 @@ def classify_document_url_openai(
     total_ms = (time.perf_counter() - started) * 1000.0
     result["processing_time_ms"] = round(total_ms, 1)
     result["ocr_weak"] = _ocr_is_weak(ocr, hint or None)
-    result["used_vision"] = bool(_ocr_is_weak(ocr, hint or None) and image_blocks)
+    result["used_vision"] = bool(
+        image_blocks and _should_attach_vision_images(image_blocks, ocr, hint or None)
+    )
+    result["vision_pages"] = len(image_blocks) if result["used_vision"] else 0
     result["extract_chars"] = len(_ocr_raw_text(ocr))
     logger.info(
         "classify_document url=%s hint=%s extract_chars=%s ocr_weak=%s vision=%s "
-        "load_ms=%.0f extract_ms=%.0f map_ms=%.0f refine_ms=%.0f total_ms=%.0f",
+        "vision_pages=%s load_ms=%.0f extract_ms=%.0f map_ms=%.0f refine_ms=%.0f total_ms=%.0f",
         url.split("/")[-1],
         hint or "-",
         result["extract_chars"],
         result["ocr_weak"],
         result["used_vision"],
+        result["vision_pages"],
         (t_load - started) * 1000.0,
         (t_ocr - t_load) * 1000.0,
         (t_main - t_ocr) * 1000.0,
