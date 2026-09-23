@@ -161,7 +161,16 @@ def process_video_frames(request, frame, scan_id, userId, clientId):
             <p>If you have any questions, feel free to reach out.</p>
             <p>Thank you for using our service.</p>
             """ 
-            send_email(email, "Health Assessment Report", html_content, [report_url, report_v2_url])
+            send_email(
+                email,
+                "Health Assessment Report",
+                html_content,
+                [report_url, report_v2_url],
+                file_names=[
+                    "Face_Scan_Health_Assessment_Detailed.pdf",
+                    "Face_Scan_Health_Assessment_Summary.pdf",
+                ],
+            )
 
         return {
             "status": "success",

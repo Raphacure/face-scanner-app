@@ -23,6 +23,7 @@ def send_email(
     subject,
     html,
     file_urls=None,
+    file_names=None,
     cc=None,
     bcc=None,
     from_email=None
@@ -32,6 +33,7 @@ def send_email(
         raise ValueError("Missing required fields: to, subject")
 
     file_urls = file_urls or []
+    file_names = file_names or []
     cc = cc or []
     bcc = bcc or []
 
@@ -51,9 +53,15 @@ def send_email(
             with open(temp_file, "rb") as f:
                 encoded = base64.b64encode(f.read()).decode()
 
+            attachment_name = (
+                file_names[index]
+                if index < len(file_names) and file_names[index]
+                else f"report_{index+1}.pdf"
+            )
+
             attachment = Attachment(
                 FileContent(encoded),
-                FileName(f"report_{index+1}.pdf"),
+                FileName(attachment_name),
                 FileType("application/pdf"),
                 Disposition("attachment")
             )
