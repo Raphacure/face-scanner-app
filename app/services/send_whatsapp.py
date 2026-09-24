@@ -23,8 +23,8 @@ def send_whatsapp_pdf(to: str, pdf_url1: str, pdf_url2: str):
             "type": "document",
             "document": {
                 "link": pdf_url1,
-                "caption": "Here is your face scan report.",
-                "filename": "Face_Scan_Report_v1.pdf"
+                "caption": "Here is your face scan detailed report.",
+                "filename": "Face_Scan_Health_Assessment_Detailed.pdf"
             }
         }
 
@@ -39,8 +39,8 @@ def send_whatsapp_pdf(to: str, pdf_url1: str, pdf_url2: str):
             "type": "document",
             "document": {
                 "link": pdf_url2,
-                "caption": "Here is your advanced face scan report.",
-                "filename": "Face_Scan_Report_v2.pdf"
+                "caption": "Here is your face scan summary report.",
+                "filename": "Face_Scan_Health_Assessment_Summary.pdf"
             }
         }
 

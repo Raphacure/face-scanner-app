@@ -68,6 +68,22 @@ _TOTAL_RE = re.compile(
     r"([\d,]+\.?\d*)",
     re.IGNORECASE,
 )
+# Indian OPD / cash-memo amounts: "Rs. 600/-", "₹600", "Rs 600 /-" (no "Total" label).
+_RS_AMOUNT_RE = re.compile(
+    r"(?:rs\.?|₹|inr)\s*([\d,]+(?:\.\d{1,2})?)\s*/?\-?",
+    re.IGNORECASE,
+)
+# Handwritten cash memos often OCR as bare "600/-" (Rs. on a separate line).
+_SLASH_AMOUNT_RE = re.compile(
+    r"\b([\d,]+(?:\.\d{1,2})?)\s*/\s*-",
+)
+_RECEIPT_AMOUNT_CUE_RE = re.compile(
+    r"(?:received\s+with\s+thanks|sum\s+of\s+rupees?|cash\s*memo|towards\s+consultation|"
+    r"\breceipt\b|authorised\s+signatory|authorized\s+signatory)",
+    re.IGNORECASE,
+)
+# Cap multi-page sync OCR (keep in sync with document_image_fetch.MAX_PDF_PAGES).
+_TEXTRACT_MAX_PAGES = 10
 # Age then gender: "25 Years / Female". Gender then age (Practo): "Female, 25 Years".
 _AGE_SEX_RE = re.compile(
     r"(?:"
@@ -184,13 +200,21 @@ _REGIONAL_HOSPITAL_HINT_RE = re.compile(
     r"హాస్పిటల్|క్లినిక్|ಆಸ್ಪತ್ರೆ|ആശുപത്രി|হাসপাতাল)",
 )
 _APPT_DATE_RE = re.compile(
-    r"(?:Appt\.?\s*Dt|Note\s*Dt|Visit\s*Date|Date)\s*[:\-]?\s*"
+    r"(?:Appt\.?\s*Dt|Note\s*Dt|Visit\s*Date|Date)\s*[:.\-_]*\s*"
     r"([0-9]{1,2}[\s/|.\-][A-Za-z]{3,9}'?\s*\d{2,4}|[0-9]{1,2}[/|.\-][0-9]{1,2}[/|.\-][0-9]{2,4})",
     re.IGNORECASE,
 )
 _STANDALONE_RX_DATE_RE = re.compile(
     r"(?:^|\n)\s*(\d{1,2}[/|.\-]\d{1,2}[/|.\-]\d{2,4})\s*(?:\n|$)",
     re.MULTILINE,
+)
+# Printed DATE / DATE....... line on hospital OPD pads (value often on adjacent line).
+_DATE_LABEL_LINE_RE = re.compile(
+    r"^(?:Date|Visit\s*Date|Appt\.?\s*Dt|Note\s*Dt)\s*[:.\-_]*\s*$",
+    re.IGNORECASE,
+)
+_LOOSE_DMY_DATE_RE = re.compile(
+    r"\b(\d{1,2}[/|.\-]\d{1,2}[/|.\-]\d{2,4})\b"
 )
 _SYSTEMIC_RE = re.compile(
     r"Systemic\s*History\s*:?\s*(.+?)(?:\n\s*Allergies|\n\s*GLASSES|\n\s*REFRACTION|\Z)",
@@ -290,6 +314,11 @@ _PAYMENT_AMOUNT_RE = re.compile(
     r"(?:₹|rs\.?|inr)\s*([\d,]+\.?\d{0,2})"
     r"|(?:(?:paid|amount\s*paid|total\s*paid)\s*[:\-]?\s*(?:₹|rs\.?|inr)?\s*"
     r"([\d,]+\.?\d{0,2}))",
+    re.IGNORECASE,
+)
+# GPay / PhonePe screenshots often OCR the big amount as a bare line above "Pay again".
+_PAYMENT_BARE_AMOUNT_RE = re.compile(
+    r"(?m)^(?:₹|rs\.?\s*)?([\d,]+(?:\.\d{1,2})?)\s*$(?:\s*(?:Pay again|Completed|Successful|Success))",
     re.IGNORECASE,
 )
 _PAYMENT_DATE_RE = re.compile(
@@ -587,6 +616,51 @@ def _orphan_patient_name_near_gender_age(lines: List[str]) -> str:
     return ""
 
 
+def _orphan_consultation_date_near_date_label(lines: List[str]) -> str:
+    """Hospital OPD pads: handwritten date above/below printed DATE ........."""
+    for idx, line in enumerate(lines):
+        raw = line.strip()
+        if not raw:
+            continue
+        # Same-line "DATE....... 22/9/26" or "22/9/26 DATE"
+        if _DATE_LABEL_LINE_RE.match(raw) or re.match(
+            r"^(?:Date|Visit\s*Date)\b", raw, re.IGNORECASE
+        ):
+            same = _LOOSE_DMY_DATE_RE.search(raw)
+            if same and not _DATE_LABEL_LINE_RE.match(raw):
+                # Label + value on one line (after dots).
+                return same.group(1).replace("|", "/")
+            # Prefer handwriting above the printed DATE dots, then below.
+            for j in list(range(idx - 1, max(-1, idx - 4), -1)) + list(
+                range(idx + 1, min(len(lines), idx + 4))
+            ):
+                cand = lines[j].strip()
+                if not cand or _DATE_LABEL_LINE_RE.match(cand):
+                    continue
+                # Skip demographics labels / long letterhead lines.
+                if re.match(
+                    r"^(?:Name|Age|Sex|UHID|Time|Patient|Doctor|Hospital|Department)\b",
+                    cand,
+                    re.IGNORECASE,
+                ):
+                    continue
+                m = _LOOSE_DMY_DATE_RE.search(cand)
+                if m and (
+                    _STANDALONE_RX_DATE_RE.match(cand)
+                    or len(cand) <= 24
+                ):
+                    return m.group(1).replace("|", "/")
+        # "22/9/26 DATE" with label after the value on the same line.
+        leading = re.match(
+            r"^(\d{1,2}[/|.\-]\d{1,2}[/|.\-]\d{2,4})\s+Date\b",
+            raw,
+            re.IGNORECASE,
+        )
+        if leading:
+            return leading.group(1).replace("|", "/")
+    return ""
+
+
 def _append_patient_name_continuation(lines: List[str], patient: str) -> str:
     """Join a second handwritten name line under Patient Name (e.g. Lakshmi)."""
     base = _clean_patient_name_value(patient)
@@ -749,6 +823,10 @@ def _parse_demographics_from_lines(lines: List[str]) -> Dict[str, str]:
         sm = _STANDALONE_RX_DATE_RE.search(text)
         if sm:
             out["consultation_date"] = sm.group(1).strip().replace("|", "/")
+    if not out["consultation_date"]:
+        orphan = _orphan_consultation_date_near_date_label(lines)
+        if orphan:
+            out["consultation_date"] = orphan
 
     systemic = _SYSTEMIC_RE.search(text)
     if systemic:
@@ -846,7 +924,82 @@ def _normalize_amount(raw: str) -> str:
     if clean.count(".") > 1:
         parts = clean.split(".")
         clean = "".join(parts[:-1]) + "." + parts[-1]
+    try:
+        if float(clean) <= 0:
+            return ""
+    except ValueError:
+        return ""
     return clean
+
+
+def _textract_max_pages() -> int:
+    try:
+        value = int(
+            os.getenv(
+                "TEXTRACT_MAX_PAGES",
+                os.getenv("PDF_VISION_MAX_PAGES", str(_TEXTRACT_MAX_PAGES)),
+            )
+        )
+    except ValueError:
+        value = _TEXTRACT_MAX_PAGES
+    return max(1, min(_TEXTRACT_MAX_PAGES, value))
+
+
+def _pick_page_payloads(
+    document_raw: bytes,
+    page_images: Optional[List[bytes]] = None,
+) -> List[bytes]:
+    """One sync payload per rendered page (multi-page PDFs: bill often on page 2+)."""
+    pages: List[bytes] = []
+    for page in page_images or []:
+        if page and len(page) <= _MAX_SYNC_BYTES:
+            pages.append(page)
+        if len(pages) >= _textract_max_pages():
+            break
+    if pages:
+        return pages
+    payload = _pick_bytes_for_sync(document_raw, page_images)
+    return [payload] if payload else []
+
+
+def _extract_total_from_text(text: str) -> str:
+    """Parse bill total from OCR text, including unlabeled Indian Rs./₹ amounts."""
+    if not text:
+        return ""
+    tot_match = _TOTAL_RE.search(text)
+    if tot_match:
+        amount = _normalize_amount(tot_match.group(1))
+        if amount:
+            return amount
+    # Prefer larger plausible cash-memo amounts when several Rs. figures appear.
+    candidates: List[float] = []
+    for match in _RS_AMOUNT_RE.finditer(text):
+        amount = _normalize_amount(match.group(1))
+        if not amount:
+            continue
+        try:
+            value = float(amount)
+        except ValueError:
+            continue
+        # Skip tiny OCR noise (page nums / qty); keep typical fee amounts.
+        if 10 <= value <= 1_000_000:
+            candidates.append(value)
+    # "600/-" without Rs. prefix — common when Textract splits "Rs." onto another line.
+    if _RECEIPT_AMOUNT_CUE_RE.search(text):
+        for match in _SLASH_AMOUNT_RE.finditer(text):
+            amount = _normalize_amount(match.group(1))
+            if not amount:
+                continue
+            try:
+                value = float(amount)
+            except ValueError:
+                continue
+            if 10 <= value <= 1_000_000:
+                candidates.append(value)
+    if not candidates:
+        return ""
+    best = max(candidates)
+    return str(int(best)) if best == int(best) else str(best)
 
 
 def _infer_payment_mode(text: str) -> str:
@@ -934,6 +1087,16 @@ def _extract_payment_fields(text: str) -> Dict[str, str]:
         except ValueError:
             if amount:
                 out["payment_amount"] = amount
+    if not out["payment_amount"]:
+        bare = _PAYMENT_BARE_AMOUNT_RE.search(text)
+        if bare:
+            amount = _normalize_amount(bare.group(1))
+            try:
+                if amount and float(amount) > 0:
+                    out["payment_amount"] = amount
+            except ValueError:
+                if amount:
+                    out["payment_amount"] = amount
 
     utr_m = _UTR_RE.search(text)
     if utr_m:
@@ -1051,22 +1214,48 @@ _EMPTY_OCR: Dict[str, str] = {
 }
 
 
+def _merge_expense_maps(maps: Sequence[Dict[str, str]]) -> Dict[str, str]:
+    """Prefer first non-empty expense field across pages (TOTAL / invoice id matter most)."""
+    out: Dict[str, str] = {}
+    priority = (
+        "TOTAL",
+        "INVOICE_RECEIPT_ID",
+        "INVOICE_RECEIPT_DATE",
+        "VENDOR_NAME",
+        "VENDOR_ADDRESS",
+        "NAME",
+        "CUSTOMER_NAME",
+        "RECEIVER_NAME",
+    )
+    for key in priority:
+        for expense in maps:
+            val = (expense.get(key) or "").strip()
+            if val:
+                out[key] = val
+                break
+    for expense in maps:
+        for key, val in expense.items():
+            if key not in out and (val or "").strip():
+                out[key] = val.strip()
+    return out
+
+
 def extract_textract_fields(
     document_raw: bytes,
     page_images: Optional[List[bytes]] = None,
 ) -> Dict[str, str]:
-    """Run Textract OCR; return claim fields (empty strings when unknown)."""
+    """Run Textract OCR; return claim fields (empty strings when unknown).
+
+    Multi-page PDFs: OCR every rendered page (bill/receipt/UPI often on page 2+).
+    """
     if not textract_enabled() or not document_raw:
         return dict(_EMPTY_OCR)
 
-    payload = _pick_bytes_for_sync(document_raw, page_images)
-    if not payload:
+    payloads = _pick_page_payloads(document_raw, page_images)
+    if not payloads:
         return dict(_EMPTY_OCR)
 
     client = get_textract_client()
-    lines: List[str] = []
-    expense: Dict[str, str] = {}
-
     use_expense = (os.getenv("TEXTRACT_ANALYZE_EXPENSE") or "true").strip().lower() in (
         "1",
         "true",
@@ -1074,7 +1263,7 @@ def extract_textract_fields(
         "on",
     )
 
-    def _detect() -> List[str]:
+    def _detect_one(payload: bytes) -> List[str]:
         try:
             detect = client.detect_document_text(Document={"Bytes": payload})
             return _lines_from_detect(detect.get("Blocks") or [])
@@ -1082,7 +1271,7 @@ def extract_textract_fields(
             _log_textract_error("detect_document_text", exc)
             return []
 
-    def _expense() -> Dict[str, str]:
+    def _expense_one(payload: bytes) -> Dict[str, str]:
         if not use_expense:
             return {}
         try:
@@ -1092,20 +1281,37 @@ def extract_textract_fields(
             _log_textract_error("analyze_expense", exc)
             return {}
 
-    # Detect + AnalyzeExpense in parallel (~saves one serial Textract RTT).
-    if use_expense:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            fut_lines = pool.submit(_detect)
-            fut_expense = pool.submit(_expense)
-            lines = fut_lines.result() or []
-            expense = fut_expense.result() or {}
-    else:
-        lines = _detect()
+    # Detect (+ expense) across pages in parallel — receipt amounts are often not on page 1.
+    workers = min(4, max(1, len(payloads) * (2 if use_expense else 1)))
+    page_lines: List[List[str]] = [[] for _ in payloads]
+    page_expenses: List[Dict[str, str]] = [{} for _ in payloads]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        detect_futs = {
+            pool.submit(_detect_one, payload): index
+            for index, payload in enumerate(payloads)
+        }
+        expense_futs = {
+            pool.submit(_expense_one, payload): index
+            for index, payload in enumerate(payloads)
+        } if use_expense else {}
+        for fut, index in detect_futs.items():
+            page_lines[index] = fut.result() or []
+        for fut, index in expense_futs.items():
+            page_expenses[index] = fut.result() or {}
 
     if not textract_enabled():
         return dict(_EMPTY_OCR)
 
+    lines: List[str] = []
+    for index, chunk in enumerate(page_lines):
+        if not chunk:
+            continue
+        if len(payloads) > 1:
+            lines.append(f"--- PAGE {index + 1} ---")
+        lines.extend(chunk)
+
     text = "\n".join(lines)
+    expense = _merge_expense_maps(page_expenses)
     demo = _parse_demographics_from_lines(lines)
     gst = _extract_gstin(text)
     if not gst:
@@ -1123,9 +1329,7 @@ def extract_textract_fields(
 
     total = _normalize_amount(expense.get("TOTAL") or "")
     if not total:
-        tot_match = _TOTAL_RE.search(text)
-        if tot_match:
-            total = _normalize_amount(tot_match.group(1))
+        total = _extract_total_from_text(text)
 
     provider = (expense.get("VENDOR_NAME") or "").strip()
     # Ignore truncated vendor tokens like "DrA"
@@ -1145,6 +1349,9 @@ def extract_textract_fields(
         patient = ""
 
     payment = _extract_payment_fields(text)
+    # OPD pack with GPay screenshot: promote paid amount into bill total when missing.
+    if not total and (payment.get("payment_amount") or "").strip():
+        total = _normalize_amount(payment.get("payment_amount") or "")
 
     return {
         "gst_number": gst,
