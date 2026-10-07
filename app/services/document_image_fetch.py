@@ -67,7 +67,21 @@ def _download_bytes(url: str) -> bytes:
 
 
 def is_pdf_bytes(data: bytes) -> bool:
-    return data[:4] == b"%PDF"
+    """True if bytes are a PDF (allows leading whitespace from some S3 uploads)."""
+    if not data:
+        return False
+    if data[:4] == b"%PDF":
+        return True
+    stripped = data.lstrip(b" \t\r\n")
+    return stripped[:4] == b"%PDF"
+
+
+def normalize_pdf_bytes(data: bytes) -> bytes:
+    """Strip leading whitespace so PDF parsers see %PDF at offset 0."""
+    if data[:4] == b"%PDF":
+        return data
+    stripped = data.lstrip(b" \t\r\n")
+    return stripped if stripped[:4] == b"%PDF" else data
 
 
 def _mime_from_image_bytes(data: bytes) -> str:
@@ -142,6 +156,7 @@ def extract_pdf_text(raw: bytes, max_pages: int = 2) -> str:
     """Plain text from a PDF text layer (empty for scanned image-only PDFs)."""
     if not is_pdf_bytes(raw):
         return ""
+    raw = normalize_pdf_bytes(raw)
     try:
         import fitz  # PyMuPDF
     except ImportError:
@@ -233,6 +248,7 @@ def rotate_image_bytes(image_bytes: bytes, degrees: int) -> bytes:
 def load_document(url: str) -> DocumentPages:
     raw = _download_bytes(url)
     if is_pdf_bytes(raw):
+        raw = normalize_pdf_bytes(raw)
         max_render = max(pdf_vision_max_pages(), pdf_refine_max_pages())
         return DocumentPages(raw=raw, page_images=render_pdf_page_images(raw, max_render))
     oriented = normalize_image_orientation(raw)
@@ -261,6 +277,7 @@ def download_document_data_urls(url: str) -> Tuple[List[str], bytes]:
     mime = _mime_from_image_bytes(raw)
 
     if mime == "application/pdf":
+        raw = normalize_pdf_bytes(raw)
         pages = render_pdf_page_images(raw, pdf_vision_max_pages())
         return [_data_url_from_bytes(p, _page_mime(p)) for p in pages], raw
 
