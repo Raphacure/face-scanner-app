@@ -1011,17 +1011,29 @@ def _ocr_context_for_prompt(ocr: Optional[Dict[str, str]]) -> str:
     )
 
 
+def _is_new_openai_chat_model(model: str) -> bool:
+    """gpt-5 / o-series / luna: different token + sampling params than gpt-4o."""
+    name = (model or "").strip().lower()
+    return name.startswith(("gpt-5", "o1", "o3", "o4")) or "luna" in name
+
+
 def _openai_max_tokens_for_hint(hint: str) -> int:
-    """Smaller cap when category is known — faster responses, same field coverage."""
+    """Token budget for extraction. Reasoning models (gpt-5/luna) need more headroom."""
+    model = (os.getenv("OPENAI_MODEL") or DEFAULT_MODEL).strip()
+    reasoning = _is_new_openai_chat_model(model)
     if normalize_document_name_hint(hint):
+        default = "4000" if reasoning else "1400"
+        floor = 2000 if reasoning else 800
         try:
-            return max(800, int(os.getenv("OPENAI_HINT_MAX_TOKENS", "1400")))
+            return max(floor, int(os.getenv("OPENAI_HINT_MAX_TOKENS", default)))
         except ValueError:
-            return 1400
+            return int(default)
+    default = "6000" if reasoning else "2200"
+    floor = 3000 if reasoning else 1200
     try:
-        return max(1200, int(os.getenv("OPENAI_MAX_TOKENS", "2200")))
+        return max(floor, int(os.getenv("OPENAI_MAX_TOKENS", default)))
     except ValueError:
-        return 2200
+        return int(default)
 
 
 def _openai_max_tokens_for_request(
@@ -1032,7 +1044,14 @@ def _openai_max_tokens_for_request(
     base = _openai_max_tokens_for_hint(hint)
     if not extract_fields:
         return base
-    estimated = min(1800, max(700, 500 + len(extract_fields) * 80))
+    model = (os.getenv("OPENAI_MODEL") or DEFAULT_MODEL).strip()
+    reasoning = _is_new_openai_chat_model(model)
+    # Reasoning models spend completion tokens on thinking before JSON.
+    estimated = (
+        min(4500, max(2500, 2000 + len(extract_fields) * 80))
+        if reasoning
+        else min(1800, max(700, 500 + len(extract_fields) * 80))
+    )
     try:
         cap = int(os.getenv("OPENAI_FIELDS_MAX_TOKENS", str(estimated)))
     except ValueError:
@@ -3398,27 +3417,57 @@ def _call_openai_json(
     max_tokens: int,
 ) -> Dict[str, Any]:
     last_error: Exception | None = None
+    new_model = _is_new_openai_chat_model(model)
+    token_budget = max_tokens
+    length_retried = False
+    create_kw: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": user_text}, *image_blocks],
+            },
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": schema_name, "strict": True, "schema": schema},
+        },
+    }
+    if not new_model:
+        create_kw["temperature"] = 0.0
     for attempt in range(OPENAI_MAX_RETRIES):
+        if new_model:
+            create_kw["max_completion_tokens"] = token_budget
+        else:
+            create_kw["max_tokens"] = token_budget
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {
-                        "role": "user",
-                        "content": [{"type": "text", "text": user_text}, *image_blocks],
-                    },
-                ],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {"name": schema_name, "strict": True, "schema": schema},
-                },
-                temperature=0.0,
-                max_tokens=max_tokens,
-            )
-            content = response.choices[0].message.content
+            response = client.chat.completions.create(**create_kw)
+            choice = response.choices[0]
+            message = choice.message
+            content = message.content
+            finish_reason = getattr(choice, "finish_reason", None)
+            refusal = getattr(message, "refusal", None)
             if not content:
-                raise ValueError("Empty response from OpenAI")
+                # Reasoning models often burn the whole budget on thinking → empty JSON.
+                if (
+                    new_model
+                    and not length_retried
+                    and finish_reason == "length"
+                ):
+                    length_retried = True
+                    token_budget = min(token_budget * 2, 8000)
+                    logger.warning(
+                        "OpenAI empty content on %s (finish_reason=length); "
+                        "retrying with max_completion_tokens=%s",
+                        schema_name,
+                        token_budget,
+                    )
+                    continue
+                detail = f"finish_reason={finish_reason}"
+                if refusal:
+                    detail += f", refusal={refusal}"
+                raise ValueError(f"Empty response from OpenAI ({detail})")
             parsed = json.loads(content)
             if not isinstance(parsed, dict):
                 raise ValueError("OpenAI response is not a JSON object")
