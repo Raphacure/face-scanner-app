@@ -3406,6 +3406,19 @@ def _is_rate_limit_error(error: Exception) -> bool:
     return "rate_limit" in str(error).lower() or "429" in str(error)
 
 
+def _is_unreadable_request_error(error: Exception) -> bool:
+    """OpenAI 400 when it cannot decode the vision payload.
+
+    Message is exactly: something went wrong reading your request.
+    Schema and other invalid_request errors must not take this path.
+    """
+    message = str(error).lower()
+    if "something went wrong reading your request" in message:
+        return True
+    body = getattr(error, "body", None)
+    return "something went wrong reading your request" in str(body or "").lower()
+
+
 def _call_openai_json(
     client: Any,
     model: str,
@@ -4033,14 +4046,43 @@ def classify_document_url_openai(
     seeded = _seed_data_from_extract(ocr, hint or None)
 
     # ── STEP 2: ANALYZE extract + MAP into API parameters ───────────────────
-    mapped = _call_openai_vision(
-        client,
-        model,
-        image_blocks,
-        hint or None,
-        fields,
-        ocr=ocr,
-    )
+    # Textract extracts the text. When that text exists, OpenAI maps it onto
+    # the claim fields. When it does not, leave the fields empty so the CRM
+    # required-field checks reject the document.
+    vision_dropped = False
+    if not _ocr_raw_text(ocr):
+        logger.info(
+            "No Textract text for %s; leaving mapped fields empty for CRM validation",
+            url.split("/")[-1],
+        )
+        mapped = {}
+        vision_dropped = True
+    else:
+        try:
+            mapped = _call_openai_vision(
+                client,
+                model,
+                image_blocks,
+                hint or None,
+                fields,
+                ocr=ocr,
+            )
+        except Exception as exc:
+            if not _is_unreadable_request_error(exc):
+                raise
+            logger.warning(
+                "OpenAI could not read page images for %s; mapping Textract OCR text to fields",
+                url.split("/")[-1],
+            )
+            vision_dropped = True
+            mapped = _call_openai_vision(
+                client,
+                model,
+                [],
+                hint or None,
+                fields,
+                ocr=ocr,
+            )
     t_main = time.perf_counter()
 
     # Prefer mapped values; keep extract-seeded values where OpenAI left blanks.
@@ -4081,7 +4123,7 @@ def classify_document_url_openai(
         _recover_medical_classification(data)
 
     refine_ms = 0.0
-    if _OPENAI_REFINE_PASSES:
+    if _OPENAI_REFINE_PASSES and not vision_dropped:
         t_refine0 = time.perf_counter()
         try:
             if _fields_need_gst_refine(fields) and (
@@ -4116,7 +4158,9 @@ def classify_document_url_openai(
     result["processing_time_ms"] = round(total_ms, 1)
     result["ocr_weak"] = _ocr_is_weak(ocr, hint or None)
     result["used_vision"] = bool(
-        image_blocks and _should_attach_vision_images(image_blocks, ocr, hint or None)
+        not vision_dropped
+        and image_blocks
+        and _should_attach_vision_images(image_blocks, ocr, hint or None)
     )
     result["vision_pages"] = len(image_blocks) if result["used_vision"] else 0
     result["extract_chars"] = len(_ocr_raw_text(ocr))
