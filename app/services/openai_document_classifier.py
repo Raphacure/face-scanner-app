@@ -648,11 +648,15 @@ REPORT: specific test_names (not section titles), test_results, dates, pathologi
 sample_collection_date aliases (MUST fill when printed): Registered On, Sample Collected On,
 Collected On, Collection Date, Received On, Sample Received, Drawn On, Scan Date, Examination Date.
 Radiology/HRCT/CT/MRI/X-ray/CBCT/OPG: no blood/urine sample — Registered On / Scan Date / Examination
-Date, OR an unlabeled printed date at the top of the report page, IS sample_collection_date AND
-usually report_date when no separate Reported On line exists.
+Date, OR an unlabeled printed study date, IS sample_collection_date AND usually report_date
+when no separate Reported On line exists.
+X-ray / CR / DR films print that study date in the patient strip, often at the BOTTOM, with no
+"Report Date" label: NAME  AGE/Y  SEX  DD-Mon-YY  EXAM (e.g. 34/Y M 05-Jan-26 → 2026-01-05).
+That date is report_date AND sample_collection_date. Do not skip it because it sits beside
+age/sex or at the bottom of the film.
 report_date aliases: Reported On, Report Date, Date of Report, Released On, Verified On,
-OR the top-of-page printed study/report date when unlabeled (common on CBCT/OPG/dental radiology).
-Do NOT use Date of Birth as report_date.
+OR an unlabeled study/report date (top of page on CBCT/OPG, or the film-footer patient strip
+on X-ray). Do NOT use Date of Birth as report_date.
 Return dates as YYYY-MM-DD. Never leave sample_collection_date empty when Registered On is printed.
 Never leave report_date empty when a report/study date is printed on the page.
 """
@@ -957,7 +961,9 @@ def _ocr_is_weak(ocr: Optional[Dict[str, str]], category_hint: Optional[str] = N
         if not total_amount:
             return True
     elif hint == "report":
-        if not patient:
+        # Film footers (white-on-dark) often OCR the name but drop DD-Mon-YY.
+        # Attach the image so the study date can still be read.
+        if not patient or not _text_has_study_date(text):
             return True
     elif not (patient or facility or doctor):
         return True
@@ -1337,6 +1343,27 @@ _STANDALONE_ISO_DATE_RE = re.compile(
     r"(?:^|\n)\s*(\d{4}-\d{2}-\d{2})\b",
     re.MULTILINE,
 )
+_MONTH_TOKEN = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*"
+_INLINE_NAMED_DATE_RE = re.compile(
+    rf"\b(\d{{1,2}}[/\-.\s]{_MONTH_TOKEN}[/\-.\s]\d{{2,4}})\b",
+    re.IGNORECASE,
+)
+# X-ray / CR patient strip: "34/Y M 05-Jan-26" or "34Y/F 05-01-2026".
+_RADIOLOGY_STRIP_DATE_RE = re.compile(
+    rf"(?:"
+    rf"\d{{1,3}}\s*/\s*[Yy]\s*[MFmf]\b"
+    rf"|\d{{1,3}}\s*[Yy]\s*/\s*[MFmf]\b"
+    rf"|\b[MFmf]\s*/\s*\d{{1,3}}\s*[Yy]?\b"
+    rf"|\d{{1,3}}\s*(?:yrs?|years?)\s*/\s*[MFmf]\b"
+    rf")"
+    rf".{{0,40}}?"
+    rf"("
+    rf"\d{{1,2}}[/\-.\s]{_MONTH_TOKEN}[/\-.\s]\d{{2,4}}"
+    rf"|\d{{4}}[/\-.]\d{{1,2}}[/\-.]\d{{1,2}}"
+    rf"|\d{{1,2}}[/|.\-]\d{{1,2}}[/|.\-]\d{{2,4}}"
+    rf")",
+    re.IGNORECASE,
+)
 _DOB_CONTEXT_RE = re.compile(
     r"(?:date\s*of\s*birth|d\.?\s*o\.?\s*b\.?|\bdob\b|born\s*on)\s*[:\-]?\s*$",
     re.IGNORECASE,
@@ -1352,6 +1379,8 @@ def _normalize_to_iso_date(raw: Any) -> str:
     original = _str_val(raw)
     text = _TIME_SUFFIX_RE.sub("", _collapse_ws(original)).strip(" .,;")
     text = text.replace("|", "/")
+    # CR film OCR often reads October as 0ct (zero).
+    text = re.sub(r"(?<=\d[\-/\s.])0([cC][tT])", r"O\1", text)
     if not text:
         return ""
 
@@ -1384,7 +1413,7 @@ def _normalize_to_iso_date(raw: Any) -> str:
 
 
 def _extract_labeled_date(text: str, pattern: re.Pattern[str]) -> str:
-    match = pattern.search(_UNICODE_SPACE_RE.sub(" ", text))
+    match = pattern.search(_fix_ocr_month_zero(_UNICODE_SPACE_RE.sub(" ", text)))
     if not match:
         return ""
     return _normalize_to_iso_date(match.group(1))
@@ -1395,28 +1424,102 @@ def _preceding_is_dob(text: str, start: int) -> bool:
     return bool(_DOB_CONTEXT_RE.search(prev))
 
 
-def _extract_header_document_date(text: str) -> str:
-    """First printed page/header date (ISO or DMY), skipping Date of Birth."""
+def _iso_date_token(raw: str) -> str:
+    normalized = _normalize_to_iso_date(raw)
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+        return normalized
+    return ""
+
+
+def _fix_ocr_month_zero(text: str) -> str:
+    """CR films often OCR October as 0ct (digit zero)."""
+    return re.sub(r"(?<=\d[\-/\s.])0([cC][tT])", r"O\1", text)
+
+
+def _flatten_ocr_text(text: str) -> str:
+    return _fix_ocr_month_zero(re.sub(r"\s+", " ", _UNICODE_SPACE_RE.sub(" ", text)))
+
+
+def _extract_radiology_film_date(text: str) -> str:
+    """Study date in an X-ray/CR patient strip, including the film footer.
+
+    Example: NAME 34/Y M 05-Jan-26 EXAM → 2026-01-05.
+    """
     if not text or not text.strip():
         return ""
-    head = text[:1500]
+    flat = _flatten_ocr_text(text)
+    match = _RADIOLOGY_STRIP_DATE_RE.search(flat)
+    if not match or _preceding_is_dob(flat, match.start(1)):
+        return ""
+    return _iso_date_token(match.group(1))
+
+
+def _extract_sole_named_date(text: str) -> str:
+    """Use a single unlabeled DD-Mon-YY date when the page has no other study date."""
+    if not text or not text.strip():
+        return ""
+    flat = _flatten_ocr_text(text)
+    found: List[str] = []
+    for match in _INLINE_NAMED_DATE_RE.finditer(flat):
+        if _preceding_is_dob(flat, match.start(1)):
+            continue
+        normalized = _iso_date_token(match.group(1))
+        if normalized and normalized not in found:
+            found.append(normalized)
+    if len(found) == 1:
+        return found[0]
+    return ""
+
+
+def _scan_region_for_numeric_date(region: str) -> str:
     for pattern in (_STANDALONE_ISO_DATE_RE, _STANDALONE_RX_DATE_RE):
-        for match in pattern.finditer(head):
-            if _preceding_is_dob(head, match.start()):
+        for match in pattern.finditer(region):
+            if _preceding_is_dob(region, match.start()):
                 continue
-            normalized = _normalize_to_iso_date(match.group(1))
-            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+            normalized = _iso_date_token(match.group(1))
+            if normalized:
                 return normalized
     for match in re.finditer(
         r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}[/|.\-]\d{1,2}[/|.\-]\d{2,4})\b",
-        head,
+        region,
     ):
-        if _preceding_is_dob(head, match.start()):
+        if _preceding_is_dob(region, match.start()):
             continue
-        normalized = _normalize_to_iso_date(match.group(1))
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+        normalized = _iso_date_token(match.group(1))
+        if normalized:
             return normalized
     return ""
+
+
+def _extract_header_document_date(text: str) -> str:
+    """Printed study/report date with no Report Date label, skipping Date of Birth.
+
+    Covers top-of-page dates and X-ray film footers (DD-Mon-YY beside age/sex).
+    """
+    if not text or not text.strip():
+        return ""
+    film = _extract_radiology_film_date(text)
+    if film:
+        return film
+    head = _scan_region_for_numeric_date(text[:1500])
+    if head:
+        return head
+    if len(text) > 1500:
+        tail = _scan_region_for_numeric_date(text[-1500:])
+        if tail:
+            return tail
+    return _extract_sole_named_date(text)
+
+
+def _text_has_study_date(text: str) -> bool:
+    """True when OCR already contains a labeled or unlabeled study/report date."""
+    if not text or not text.strip():
+        return False
+    if _extract_labeled_date(text, _REPORT_DATE_LABEL_RE):
+        return True
+    if _extract_labeled_date(text, _SAMPLE_COLLECTION_LABEL_RE):
+        return True
+    return bool(_extract_header_document_date(text))
 
 
 def _extract_consultation_date_from_text(text: str) -> str:
@@ -1469,7 +1572,7 @@ def _fill_labeled_dates_from_text(data: Dict[str, Any], text: str) -> None:
     report = _extract_labeled_date(text, _REPORT_DATE_LABEL_RE)
     consultation = _extract_consultation_date_from_text(text)
     header = _extract_header_document_date(text)
-    # CBCT/OPG/radiology often print only an unlabeled top date (e.g. 2026-08-16).
+    # CBCT/OPG top dates and X-ray film footers (AGE/Y SEX DD-Mon-YY) are unlabeled.
     if not report:
         report = header
     if not sample:
@@ -3566,10 +3669,13 @@ def _call_openai_vision(
             date_note = (
                 " DATE ALIASES: sample_collection_date = Registered On, Sample Collected On, "
                 "Collected On, Received On, Scan Date, Examination Date "
-                "(on radiology/HRCT/CBCT/OPG, Registered On / Scan Date / unlabeled top date "
+                "(on radiology/HRCT/CBCT/OPG/X-ray, Registered On / Scan Date / unlabeled study date "
                 "IS sample_collection_date). "
-                "report_date = Reported On, Report Date, Date of Report, OR unlabeled top-of-page "
-                "study/report date (do not use Date of Birth). Use YYYY-MM-DD."
+                "report_date = Reported On, Report Date, Date of Report, OR an unlabeled study date. "
+                "X-ray/CR film footers print it in the patient strip, often at the BOTTOM, with no label: "
+                "NAME AGE/Y SEX DD-Mon-YY EXAM (e.g. 34/Y M 05-Jan-26 → 2026-01-05). "
+                "That date IS report_date and sample_collection_date. Do not use Date of Birth. "
+                "Use YYYY-MM-DD."
             )
         if "consultation_date" in field_list:
             date_note += (
@@ -4117,6 +4223,7 @@ def classify_document_url_openai(
     # Extract remains source of truth for empty gaps after mapping.
     merge_textract_into_openai_data(data, ocr)
     fill_demographics_from_text(data, ocr.get("raw_text") or "")
+    _fill_labeled_dates_from_text(data, ocr.get("raw_text") or "")
     if hint:
         _apply_category_hint(data, hint)
     else:
@@ -4147,6 +4254,7 @@ def classify_document_url_openai(
 
         merge_textract_into_openai_data(data, ocr)
         fill_demographics_from_text(data, ocr.get("raw_text") or "")
+        _fill_labeled_dates_from_text(data, ocr.get("raw_text") or "")
         if hint:
             _apply_category_hint(data, hint)
 
