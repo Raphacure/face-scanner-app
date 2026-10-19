@@ -325,6 +325,9 @@ def _parameters_from_extraction(
     date_val = _str_val(params.get("consultation_date"))
     if date_val:
         params["consultation_date"] = _normalize_to_iso_date(date_val)
+    txn_date = _iso_date_token(params.get("transaction_date"))
+    if txn_date:
+        params["transaction_date"] = txn_date
     return params
 
 
@@ -599,7 +602,10 @@ Dental/eye: item_details[] procedures or frame/lens lines.
 PAYMENT_RECEIPT (mandatory when visible — do not invent):
 - payment_mode: upi | bank_transfer | card | cash | wallet
 - payment_amount: digits only (e.g. "684.00") — the paid amount, not balance
-- transaction_date: ISO-like YYYY-MM-DD when possible, else as printed
+- transaction_date: ISO YYYY-MM-DD. On UPI/bank screens use Paid on / Transaction date / Payment date.
+  On a clinic bill, cash memo, or handwritten receipt, the bill date is transaction_date even with
+  no label — a date written at the top of the page (e.g. 2/10/2026 or 02-10-26). Do not leave
+  transaction_date empty when that date is visible. 2-digit years → 20xx. Never use DOB.
 - transaction_id: primary txn / UTR / UPI ref / bank ref
 - payment_status: success | completed | failed | pending (normalize synonyms; "Payment Successful"→success)
 Strongly recommended: payee_name, payer_name, upi_id (VPA like name@bank), bank_name,
@@ -964,6 +970,11 @@ def _ocr_is_weak(ocr: Optional[Dict[str, str]], category_hint: Optional[str] = N
         # Film footers (white-on-dark) often OCR the name but drop DD-Mon-YY.
         # Attach the image so the study date can still be read.
         if not patient or not _text_has_study_date(text):
+            return True
+    elif hint == "payment_receipt":
+        # Handwritten bill dates have no "Paid on" label and OCR often misreads the year.
+        labeled = _extract_labeled_date(text, _RECEIPT_DATE_LABEL_RE)
+        if not _iso_date_token(labeled):
             return True
     elif not (patient or facility or doctor):
         return True
@@ -1522,6 +1533,31 @@ def _text_has_study_date(text: str) -> bool:
     return bool(_extract_header_document_date(text))
 
 
+_RECEIPT_DATE_LABEL_RE = re.compile(
+    r"(?:"
+    r"transaction\s*date"
+    r"|payment\s*date"
+    r"|paid\s*on"
+    r"|invoice\s*date"
+    r"|bill\s*date"
+    r"|date\s*of\s*(?:payment|invoice|bill|receipt)"
+    r"|^date"
+    r")\s*[:.\-_]*\s*"
+    + _DATE_VALUE_RE,
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _extract_transaction_date_from_text(text: str) -> str:
+    """Bill or payment date, including an unlabeled handwritten date on a receipt."""
+    if not text or not text.strip():
+        return ""
+    labeled = _extract_labeled_date(text, _RECEIPT_DATE_LABEL_RE)
+    if _iso_date_token(labeled):
+        return _iso_date_token(labeled)
+    return _extract_header_document_date(text)
+
+
 def _extract_consultation_date_from_text(text: str) -> str:
     """Pull consultation/visit date from labeled or standalone Rx header text."""
     if not text or not text.strip():
@@ -1598,6 +1634,34 @@ def _fill_labeled_dates_from_text(data: Dict[str, Any], text: str) -> None:
             data[bucket_key] = bucket
         if not _is_meaningful_string(bucket.get(field)):
             bucket[field] = value
+
+
+def _fill_transaction_date_from_text(data: Dict[str, Any], text: str) -> None:
+    """Fill an empty payment-receipt transaction_date from the bill/receipt date."""
+    found = _extract_transaction_date_from_text(text)
+    if not found:
+        for bucket_key in ("invoice_parameters", "parameters", "prescription_parameters"):
+            bucket = data.get(bucket_key)
+            if not isinstance(bucket, dict):
+                continue
+            for key in ("invoice_date", "consultation_date"):
+                iso = _iso_date_token(bucket.get(key))
+                if iso:
+                    found = iso
+                    break
+            if found:
+                break
+    for bucket_key in ("payment_receipt_parameters", "parameters"):
+        bucket = data.get(bucket_key)
+        if not isinstance(bucket, dict):
+            bucket = {}
+            data[bucket_key] = bucket
+        current = _iso_date_token(bucket.get("transaction_date"))
+        if current:
+            bucket["transaction_date"] = current
+            continue
+        if found:
+            bucket["transaction_date"] = found
 
 
 def _normalize_report_fields(params: Dict[str, Any]) -> None:
@@ -2332,6 +2396,9 @@ def _normalize_payment_receipt_fields(params: Dict[str, Any]) -> None:
             params[key] = val
 
     params["payment_amount"] = _normalize_payment_amount(params.get("payment_amount"))
+    txn_date = _iso_date_token(params.get("transaction_date"))
+    if txn_date:
+        params["transaction_date"] = txn_date
     params["payment_status"] = _normalize_payment_status(params.get("payment_status"))
     params["payment_mode"] = _normalize_payment_mode(params.get("payment_mode"))
     params["bank_name"] = _normalize_bank_name(params.get("bank_name"))
@@ -3677,6 +3744,14 @@ def _call_openai_vision(
                 "That date IS report_date and sample_collection_date. Do not use Date of Birth. "
                 "Use YYYY-MM-DD."
             )
+        if "transaction_date" in field_list:
+            date_note += (
+                " TRANSACTION DATE: on a clinic bill, cash memo, or handwritten receipt, the date "
+                "written at the top of the page is transaction_date even when it has no label "
+                "(e.g. 2/10/2026 or 02-10-26). On UPI screens use Paid on / Transaction date. "
+                "Do not leave transaction_date empty when that date is visible. "
+                "Normalize to YYYY-MM-DD (2-digit year → 20xx). Never use DOB."
+            )
         if "consultation_date" in field_list:
             date_note += (
                 " CONSULTATION DATE: on OPD/hospital Rx pads read the handwritten date on, above, "
@@ -4224,6 +4299,8 @@ def classify_document_url_openai(
     merge_textract_into_openai_data(data, ocr)
     fill_demographics_from_text(data, ocr.get("raw_text") or "")
     _fill_labeled_dates_from_text(data, ocr.get("raw_text") or "")
+    if hint == "payment_receipt" or (fields and "transaction_date" in fields):
+        _fill_transaction_date_from_text(data, ocr.get("raw_text") or "")
     if hint:
         _apply_category_hint(data, hint)
     else:
@@ -4255,6 +4332,8 @@ def classify_document_url_openai(
         merge_textract_into_openai_data(data, ocr)
         fill_demographics_from_text(data, ocr.get("raw_text") or "")
         _fill_labeled_dates_from_text(data, ocr.get("raw_text") or "")
+        if hint == "payment_receipt" or (fields and "transaction_date" in fields):
+            _fill_transaction_date_from_text(data, ocr.get("raw_text") or "")
         if hint:
             _apply_category_hint(data, hint)
 
