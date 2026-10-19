@@ -199,6 +199,24 @@ _REGIONAL_HOSPITAL_HINT_RE = re.compile(
     r"(மருத்துவமனை|கிளினிக்|अस्पताल|हॉस्पिटल|क्लिनिक|"
     r"హాస్పిటల్|క్లినిక్|ಆಸ್ಪತ್ರೆ|ആശുപത്രി|হাসপাতাল)",
 )
+def _compact_spaced_date_separators(text: str) -> str:
+    """Turn clinic dates like '3. 10. 26' and '3,10,26' into '3.10.26'."""
+    if not text:
+        return ""
+    text = (
+        text.replace("\u00b7", ".")
+        .replace("\u2024", ".")
+        .replace("\u2219", ".")
+        .replace("•", ".")
+    )
+    text = re.sub(r"(\d)\s*([/|.\-])\s*(?=\d)", r"\1\2", text)
+    return re.sub(
+        r"\b(\d{1,2})\s*,\s*(\d{1,2})\s*,\s*(\d{2,4})\b",
+        r"\1.\2.\3",
+        text,
+    )
+
+
 _APPT_DATE_RE = re.compile(
     r"(?:Appt\.?\s*Dt|Note\s*Dt|Visit\s*Date|Date)\s*[:.\-_]*\s*"
     r"([0-9]{1,2}[\s/|.\-][A-Za-z]{3,9}'?\s*\d{2,4}|[0-9]{1,2}[/|.\-][0-9]{1,2}[/|.\-][0-9]{2,4})",
@@ -322,8 +340,8 @@ _PAYMENT_BARE_AMOUNT_RE = re.compile(
     re.IGNORECASE,
 )
 _PAYMENT_DATE_RE = re.compile(
-    r"(?:(?:paid\s*on|transaction\s*date|payment\s*date)\s*[:\-]?\s*)"
-    r"(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}"
+    r"(?:(?:paid\s*on|transaction\s*date|payment\s*date|bill\s*date|invoice\s*date|\bdate)\s*[:.\-_]*\s*)"
+    r"(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}"
     r"|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}"
     r"|\d{4}-\d{2}-\d{2})",
     re.IGNORECASE,
@@ -816,15 +834,17 @@ def _parse_demographics_from_lines(lines: List[str]) -> Dict[str, str]:
             if not re.search(r"\bnotes?/prescriptions?\b", facility, re.I):
                 out["clinic_hospital_name"] = facility
 
-    dm = _APPT_DATE_RE.search(text)
+    date_text = _compact_spaced_date_separators(text)
+    date_lines = [_compact_spaced_date_separators(line) for line in lines]
+    dm = _APPT_DATE_RE.search(date_text)
     if dm:
         out["consultation_date"] = re.sub(r"\s+", " ", dm.group(1)).strip().replace("|", "/")
     if not out["consultation_date"]:
-        sm = _STANDALONE_RX_DATE_RE.search(text)
+        sm = _STANDALONE_RX_DATE_RE.search(date_text)
         if sm:
             out["consultation_date"] = sm.group(1).strip().replace("|", "/")
     if not out["consultation_date"]:
-        orphan = _orphan_consultation_date_near_date_label(lines)
+        orphan = _orphan_consultation_date_near_date_label(date_lines)
         if orphan:
             out["consultation_date"] = orphan
 
@@ -1071,6 +1091,12 @@ def _extract_payment_fields(text: str) -> Dict[str, str]:
     if not text:
         return out
 
+    # Clinic pads write the bill date as "Date : 3. 10. 26". Keep that even when
+    # the page is clinical and the rest of the payment fields should stay empty.
+    date_m = _PAYMENT_DATE_RE.search(_compact_spaced_date_separators(text))
+    if date_m:
+        out["transaction_date"] = re.sub(r"\s+", " ", date_m.group(1)).strip()
+
     # Clinical / OPD pages often contain Axis/email/time noise — skip payment OCR.
     if _MEDICAL_DOC_CUE_RE.search(text) and not (
         _PAYMENT_APP_RE.search(text)
@@ -1118,9 +1144,10 @@ def _extract_payment_fields(text: str) -> Dict[str, str]:
             out["upi_id"] = candidate
             break
 
-    date_m = _PAYMENT_DATE_RE.search(text)
-    if date_m:
-        out["transaction_date"] = re.sub(r"\s+", " ", date_m.group(1)).strip()
+    if not out["transaction_date"]:
+        date_m = _PAYMENT_DATE_RE.search(_compact_spaced_date_separators(text))
+        if date_m:
+            out["transaction_date"] = re.sub(r"\s+", " ", date_m.group(1)).strip()
 
     ifsc_m = _IFSC_RE.search(text)
     if ifsc_m:

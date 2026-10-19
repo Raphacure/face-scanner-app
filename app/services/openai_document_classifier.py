@@ -603,9 +603,10 @@ PAYMENT_RECEIPT (mandatory when visible — do not invent):
 - payment_mode: upi | bank_transfer | card | cash | wallet
 - payment_amount: digits only (e.g. "684.00") — the paid amount, not balance
 - transaction_date: ISO YYYY-MM-DD. On UPI/bank screens use Paid on / Transaction date / Payment date.
-  On a clinic bill, cash memo, or handwritten receipt, the bill date is transaction_date even with
-  no label — a date written at the top of the page (e.g. 2/10/2026 or 02-10-26). Do not leave
-  transaction_date empty when that date is visible. 2-digit years → 20xx. Never use DOB.
+  On a clinic bill, cash memo, OPD pad, or eye/clinic form uploaded as a payment receipt, the
+  printed or handwritten "Date :" beside the doctor name or at the top IS transaction_date
+  (e.g. 3.10.26, 3. 10. 26, 3,10,26, 02-10-26, 2/10/2026). Do not leave transaction_date empty
+  when that date is visible. 2-digit years → 20xx. Never use DOB.
 - transaction_id: primary txn / UTR / UPI ref / bank ref
 - payment_status: success | completed | failed | pending (normalize synonyms; "Payment Successful"→success)
 Strongly recommended: payee_name, payer_name, upi_id (VPA like name@bank), bank_name,
@@ -1341,7 +1342,7 @@ _CONSULTATION_DATE_LABEL_RE = re.compile(
     r"|appt\.?\s*dt"
     r"|note\s*dt"
     r"|date\s*of\s*visit"
-    r"|^date"
+    r"|\bdate\b"
     r")\s*[:.\-_]*\s*"
     + _DATE_VALUE_RE,
     re.IGNORECASE | re.MULTILINE,
@@ -1385,10 +1386,29 @@ def _collapse_ws(raw: str) -> str:
     return re.sub(r"\s+", " ", _UNICODE_SPACE_RE.sub(" ", raw)).strip()
 
 
+def _compact_spaced_date_separators(text: str) -> str:
+    """Turn clinic dates like '3. 10. 26' and '3,10,26' into '3.10.26'."""
+    if not text:
+        return ""
+    text = (
+        text.replace("\u00b7", ".")
+        .replace("\u2024", ".")
+        .replace("\u2219", ".")
+        .replace("•", ".")
+    )
+    text = re.sub(r"(\d)\s*([/|.\-])\s*(?=\d)", r"\1\2", text)
+    return re.sub(
+        r"\b(\d{1,2})\s*,\s*(\d{1,2})\s*,\s*(\d{2,4})\b",
+        r"\1.\2.\3",
+        text,
+    )
+
+
 def _normalize_to_iso_date(raw: Any) -> str:
     """Normalize printed Indian dates to YYYY-MM-DD; keep original if unparseable."""
     original = _str_val(raw)
     text = _TIME_SUFFIX_RE.sub("", _collapse_ws(original)).strip(" .,;")
+    text = _compact_spaced_date_separators(text)
     text = text.replace("|", "/")
     # CR film OCR often reads October as 0ct (zero).
     text = re.sub(r"(?<=\d[\-/\s.])0([cC][tT])", r"O\1", text)
@@ -1424,7 +1444,10 @@ def _normalize_to_iso_date(raw: Any) -> str:
 
 
 def _extract_labeled_date(text: str, pattern: re.Pattern[str]) -> str:
-    match = pattern.search(_fix_ocr_month_zero(_UNICODE_SPACE_RE.sub(" ", text)))
+    cleaned = _compact_spaced_date_separators(
+        _fix_ocr_month_zero(_UNICODE_SPACE_RE.sub(" ", text))
+    )
+    match = pattern.search(cleaned)
     if not match:
         return ""
     return _normalize_to_iso_date(match.group(1))
@@ -1509,6 +1532,7 @@ def _extract_header_document_date(text: str) -> str:
     """
     if not text or not text.strip():
         return ""
+    text = _compact_spaced_date_separators(text)
     film = _extract_radiology_film_date(text)
     if film:
         return film
@@ -1541,7 +1565,7 @@ _RECEIPT_DATE_LABEL_RE = re.compile(
     r"|invoice\s*date"
     r"|bill\s*date"
     r"|date\s*of\s*(?:payment|invoice|bill|receipt)"
-    r"|^date"
+    r"|\bdate\b"
     r")\s*[:.\-_]*\s*"
     + _DATE_VALUE_RE,
     re.IGNORECASE | re.MULTILINE,
@@ -1562,6 +1586,7 @@ def _extract_consultation_date_from_text(text: str) -> str:
     """Pull consultation/visit date from labeled or standalone Rx header text."""
     if not text or not text.strip():
         return ""
+    text = _compact_spaced_date_separators(text)
     labeled = _extract_labeled_date(text, _CONSULTATION_DATE_LABEL_RE)
     if labeled:
         return labeled
@@ -3746,9 +3771,11 @@ def _call_openai_vision(
             )
         if "transaction_date" in field_list:
             date_note += (
-                " TRANSACTION DATE: on a clinic bill, cash memo, or handwritten receipt, the date "
-                "written at the top of the page is transaction_date even when it has no label "
-                "(e.g. 2/10/2026 or 02-10-26). On UPI screens use Paid on / Transaction date. "
+                " TRANSACTION DATE: on a clinic bill, cash memo, OPD pad, or eye/clinic form, "
+                "the printed or handwritten Date beside the doctor name or at the top of the page "
+                "is transaction_date even when the only label is \"Date :\" "
+                "(e.g. 3.10.26, 3. 10. 26, 3,10,26, 2/10/2026, or 02-10-26). "
+                "On UPI screens use Paid on / Transaction date. "
                 "Do not leave transaction_date empty when that date is visible. "
                 "Normalize to YYYY-MM-DD (2-digit year → 20xx). Never use DOB."
             )
