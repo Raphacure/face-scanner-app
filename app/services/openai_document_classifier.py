@@ -326,6 +326,8 @@ def _parameters_from_extraction(
     if date_val:
         params["consultation_date"] = _normalize_to_iso_date(date_val)
     txn_date = _iso_date_token(params.get("transaction_date"))
+    if not txn_date and "transaction_date" in extract_fields:
+        txn_date = _fallback_transaction_date(params, *sources)
     if txn_date:
         params["transaction_date"] = txn_date
     return params
@@ -605,8 +607,8 @@ PAYMENT_RECEIPT (mandatory when visible — do not invent):
 - transaction_date: ISO YYYY-MM-DD. On UPI/bank screens use Paid on / Transaction date / Payment date.
   On a clinic bill, cash memo, OPD pad, or eye/clinic form uploaded as a payment receipt, the
   printed or handwritten "Date :" beside the doctor name or at the top IS transaction_date
-  (e.g. 3.10.26, 3. 10. 26, 3,10,26, 02-10-26, 2/10/2026). Do not leave transaction_date empty
-  when that date is visible. 2-digit years → 20xx. Never use DOB.
+  (e.g. 3-Oct-2026, 3 Oct 2026, 3.10.26, 3. 10. 26, 3,10,26, 02-10-26, 2/10/2026).
+  Do not leave transaction_date empty when that date is visible. 2-digit years → 20xx. Never use DOB.
 - transaction_id: primary txn / UTR / UPI ref / bank ref
 - payment_status: success | completed | failed | pending (normalize synonyms; "Payment Successful"→success)
 Strongly recommended: payee_name, payer_name, upi_id (VPA like name@bank), bank_name,
@@ -1283,13 +1285,13 @@ _MONTH_LOOKUP = {
     "december": 12,
 }
 _NAMED_DATE_RE = re.compile(
-    r"^(\d{1,2})[/\-.\s]([A-Za-z]{3,9})[/\-.\s](\d{2,4})$"
+    r"^(\d{1,2})[/\-.\s,]+([A-Za-z]{3,9})\.?[/\-.\s,]+(\d{2,4})$"
 )
 _YMD_DATE_RE = re.compile(r"^(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})$")
 _DMY_DATE_RE = re.compile(r"^(\d{1,2})[/|.\-](\d{1,2})[/|.\-](\d{2,4})$")
 _DATE_VALUE_RE = (
-    r"(\d{1,2}[/\-.\s](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*"
-    r"[/\-.\s]\d{2,4}"
+    r"(\d{1,2}[/\-.\s,]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?"
+    r"[/\-.\s,]+\d{2,4}"
     r"(?:\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AaPp]\.?[Mm]\.?)?)?"
     r"|\d{4}[/\-.]\d{1,2}[/\-.]\d{1,2}"
     r"(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?"
@@ -1355,9 +1357,9 @@ _STANDALONE_ISO_DATE_RE = re.compile(
     r"(?:^|\n)\s*(\d{4}-\d{2}-\d{2})\b",
     re.MULTILINE,
 )
-_MONTH_TOKEN = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*"
+_MONTH_TOKEN = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?"
 _INLINE_NAMED_DATE_RE = re.compile(
-    rf"\b(\d{{1,2}}[/\-.\s]{_MONTH_TOKEN}[/\-.\s]\d{{2,4}})\b",
+    rf"\b(\d{{1,2}}[/\-.\s,]+{_MONTH_TOKEN}[/\-.\s,]+\d{{2,4}})\b",
     re.IGNORECASE,
 )
 # X-ray / CR patient strip: "34/Y M 05-Jan-26" or "34Y/F 05-01-2026".
@@ -1395,6 +1397,9 @@ def _compact_spaced_date_separators(text: str) -> str:
         .replace("\u2024", ".")
         .replace("\u2219", ".")
         .replace("•", ".")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u2212", "-")
     )
     text = re.sub(r"(\d)\s*([/|.\-])\s*(?=\d)", r"\1\2", text)
     return re.sub(
@@ -1402,6 +1407,50 @@ def _compact_spaced_date_separators(text: str) -> str:
         r"\1.\2.\3",
         text,
     )
+
+
+def _iso_from_date_parts(day: int, month: int, year: int) -> str:
+    if year < 100:
+        year += 2000
+    if 1 <= month <= 12 and 1 <= day <= 31:
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    return ""
+
+
+def _iso_from_date_token(token: str) -> str:
+    """Parse a standalone date token; empty when the token is not a date."""
+    text = _TIME_SUFFIX_RE.sub("", _collapse_ws(token)).strip(" .,;")
+    text = _compact_spaced_date_separators(text)
+    text = text.replace("|", "/")
+    text = re.sub(r"(?<=\d[\-/\s.])0([cC][tT])", r"O\1", text)
+    if not text:
+        return ""
+
+    named = _NAMED_DATE_RE.match(text)
+    if named:
+        day_s, month_s, year_s = named.groups()
+        month = _MONTH_LOOKUP.get(month_s.lower()) or _MONTH_LOOKUP.get(
+            month_s.lower()[:3]
+        )
+        if month:
+            iso = _iso_from_date_parts(int(day_s), month, int(year_s))
+            if iso:
+                return iso
+
+    ymd = _YMD_DATE_RE.match(text)
+    if ymd:
+        year, month, day = (int(part) for part in ymd.groups())
+        iso = _iso_from_date_parts(day, month, year)
+        if iso:
+            return iso
+
+    dmy = _DMY_DATE_RE.match(text)
+    if dmy:
+        day, month, year = (int(part) for part in dmy.groups())
+        iso = _iso_from_date_parts(day, month, year)
+        if iso:
+            return iso
+    return ""
 
 
 def _normalize_to_iso_date(raw: Any) -> str:
@@ -1415,31 +1464,22 @@ def _normalize_to_iso_date(raw: Any) -> str:
     if not text:
         return ""
 
-    named = _NAMED_DATE_RE.match(text)
-    if named:
-        day_s, month_s, year_s = named.groups()
-        month = _MONTH_LOOKUP.get(month_s.lower()) or _MONTH_LOOKUP.get(month_s.lower()[:3])
-        if month:
-            year = int(year_s)
-            if year < 100:
-                year += 2000
-            day = int(day_s)
-            if 1 <= day <= 31:
-                return f"{year:04d}-{month:02d}-{day:02d}"
-
-    ymd = _YMD_DATE_RE.match(text)
-    if ymd:
-        year, month, day = (int(part) for part in ymd.groups())
-        if 1 <= month <= 12 and 1 <= day <= 31:
-            return f"{year:04d}-{month:02d}-{day:02d}"
-
-    dmy = _DMY_DATE_RE.match(text)
-    if dmy:
-        day, month, year = (int(part) for part in dmy.groups())
-        if year < 100:
-            year += 2000
-        if 1 <= month <= 12 and 1 <= day <= 31:
-            return f"{year:04d}-{month:02d}-{day:02d}"
+    parsed = _iso_from_date_token(text)
+    if parsed:
+        return parsed
+    inner_named = _INLINE_NAMED_DATE_RE.search(text)
+    if inner_named:
+        parsed = _iso_from_date_token(inner_named.group(1))
+        if parsed:
+            return parsed
+    inner_numeric = re.search(
+        r"\b(\d{4}[/\-.]\d{1,2}[/\-.]\d{1,2}|\d{1,2}[/|.\-]\d{1,2}[/|.\-]\d{2,4})\b",
+        text,
+    )
+    if inner_numeric:
+        parsed = _iso_from_date_token(inner_numeric.group(1))
+        if parsed:
+            return parsed
     return original
 
 
@@ -1661,21 +1701,34 @@ def _fill_labeled_dates_from_text(data: Dict[str, Any], text: str) -> None:
             bucket[field] = value
 
 
+def _fallback_transaction_date(*buckets: Any) -> str:
+    """Bill/visit/report date used as payment transaction_date on clinic receipts."""
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            continue
+        for key in (
+            "transaction_date",
+            "invoice_date",
+            "consultation_date",
+            "report_date",
+        ):
+            iso = _iso_date_token(bucket.get(key))
+            if iso:
+                return iso
+    return ""
+
+
 def _fill_transaction_date_from_text(data: Dict[str, Any], text: str) -> None:
     """Fill an empty payment-receipt transaction_date from the bill/receipt date."""
     found = _extract_transaction_date_from_text(text)
     if not found:
-        for bucket_key in ("invoice_parameters", "parameters", "prescription_parameters"):
-            bucket = data.get(bucket_key)
-            if not isinstance(bucket, dict):
-                continue
-            for key in ("invoice_date", "consultation_date"):
-                iso = _iso_date_token(bucket.get(key))
-                if iso:
-                    found = iso
-                    break
-            if found:
-                break
+        found = _fallback_transaction_date(
+            data.get("payment_receipt_parameters"),
+            data.get("invoice_parameters"),
+            data.get("parameters"),
+            data.get("prescription_parameters"),
+            data.get("report_parameters"),
+        )
     for bucket_key in ("payment_receipt_parameters", "parameters"):
         bucket = data.get(bucket_key)
         if not isinstance(bucket, dict):
@@ -2952,8 +3005,10 @@ def _seed_payment_from_invoice_leak(
         pay["transaction_id"] = ref
         if not _str_val(pay.get("reference_number")):
             pay["reference_number"] = ref
-    if not _is_filled(pay, "transaction_date") and _is_filled(inv, "invoice_date"):
-        pay["transaction_date"] = _str_val(inv.get("invoice_date"))
+    if not _iso_date_token(pay.get("transaction_date")):
+        copied = _fallback_transaction_date(pay, inv)
+        if copied:
+            pay["transaction_date"] = copied
     if not _is_filled(pay, "payer_name") and _is_filled(inv, "patient_name"):
         # Only when other payment rails already present (avoid Rx patient → payer).
         if (
@@ -3414,6 +3469,12 @@ def _build_public_response(
     )
 
     if category == "payment_receipt":
+        _seed_payment_from_invoice_leak(pay_params, inv_params)
+        txn = _fallback_transaction_date(pay_params, inv_params, rx_params, rep_params)
+        if txn:
+            pay_params["transaction_date"] = txn
+        _normalize_payment_receipt_fields(pay_params)
+        data["payment_receipt_parameters"] = pay_params
         parameters = pay_params
         extra_checks = _payment_receipt_extra_checks(parameters)
         required_fields = (
@@ -3774,7 +3835,7 @@ def _call_openai_vision(
                 " TRANSACTION DATE: on a clinic bill, cash memo, OPD pad, or eye/clinic form, "
                 "the printed or handwritten Date beside the doctor name or at the top of the page "
                 "is transaction_date even when the only label is \"Date :\" "
-                "(e.g. 3.10.26, 3. 10. 26, 3,10,26, 2/10/2026, or 02-10-26). "
+                "(e.g. 3-Oct-2026, 3 Oct 2026, 3.10.26, 3. 10. 26, 3,10,26, 2/10/2026, or 02-10-26). "
                 "On UPI screens use Paid on / Transaction date. "
                 "Do not leave transaction_date empty when that date is visible. "
                 "Normalize to YYYY-MM-DD (2-digit year → 20xx). Never use DOB."
@@ -4416,6 +4477,59 @@ def _refresh_prescription_result_completeness(result: Dict[str, Any]) -> None:
     completeness, missing = _reconcile_missing_parameters(params, required, extra)
     result["completeness_percent"] = completeness
     result["missing_parameters"] = missing
+
+
+def _refresh_payment_receipt_result_completeness(result: Dict[str, Any]) -> None:
+    """Recompute payment-receipt completeness after sibling date fill."""
+    params = result.get("parameters")
+    if not isinstance(params, dict):
+        return
+    fields = result.get("fields")
+    if fields:
+        required = tuple(fields)
+        extra: Tuple[Any, ...] = ()
+    else:
+        required = PAYMENT_RECEIPT_REQUIRED
+        extra = tuple(_payment_receipt_extra_checks(params))
+    completeness, missing = _reconcile_missing_parameters(params, required, extra)
+    result["completeness_percent"] = completeness
+    result["missing_parameters"] = missing
+
+
+def enrich_claim_batch_transaction_dates(results: List[Dict[str, Any]]) -> None:
+    """Fill empty payment-receipt transaction_date from sibling bill/visit dates."""
+    dates: List[str] = []
+    for result in results:
+        if result.get("error"):
+            continue
+        params = result.get("parameters")
+        if not isinstance(params, dict):
+            continue
+        iso = _fallback_transaction_date(params)
+        if iso:
+            dates.append(iso)
+
+    if not dates:
+        return
+    fallback = dates[0]
+    if len(set(dates)) == 1:
+        fallback = dates[0]
+
+    for result in results:
+        if result.get("error"):
+            continue
+        category = str(result.get("document_category") or result.get("name") or "")
+        if category != "payment_receipt":
+            continue
+        params = result.get("parameters")
+        if not isinstance(params, dict):
+            continue
+        current = _iso_date_token(params.get("transaction_date"))
+        if current:
+            params["transaction_date"] = current
+            continue
+        params["transaction_date"] = fallback
+        _refresh_payment_receipt_result_completeness(result)
 
 
 def enrich_claim_batch_doctor_names(results: List[Dict[str, Any]]) -> None:
