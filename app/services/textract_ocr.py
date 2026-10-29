@@ -208,7 +208,12 @@ def _compact_spaced_date_separators(text: str) -> str:
         .replace("\u2024", ".")
         .replace("\u2219", ".")
         .replace("•", ".")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u2212", "-")
     )
+    # CR / receipt OCR often reads October as 0ct (digit zero).
+    text = re.sub(r"(?<=\d[\-/\s.])0([cC][tT])", r"O\1", text)
     text = re.sub(r"(\d)\s*([/|.\-])\s*(?=\d)", r"\1\2", text)
     return re.sub(
         r"\b(\d{1,2})\s*,\s*(\d{1,2})\s*,\s*(\d{2,4})\b",
@@ -217,9 +222,11 @@ def _compact_spaced_date_separators(text: str) -> str:
     )
 
 
+_MONTH_NAME = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?"
+_NAMED_DATE_CAPTURE = rf"\d{{1,2}}[/\-.\s,]+{_MONTH_NAME}[/\-.\s,]+\d{{2,4}}"
 _APPT_DATE_RE = re.compile(
     r"(?:Appt\.?\s*Dt|Note\s*Dt|Visit\s*Date|Date)\s*[:.\-_]*\s*"
-    r"([0-9]{1,2}[\s/|.\-][A-Za-z]{3,9}'?\s*\d{2,4}|[0-9]{1,2}[/|.\-][0-9]{1,2}[/|.\-][0-9]{2,4})",
+    rf"({_NAMED_DATE_CAPTURE}|[0-9]{{1,2}}[/|.\-][0-9]{{1,2}}[/|.\-][0-9]{{2,4}})",
     re.IGNORECASE,
 )
 _STANDALONE_RX_DATE_RE = re.compile(
@@ -340,9 +347,10 @@ _PAYMENT_BARE_AMOUNT_RE = re.compile(
     re.IGNORECASE,
 )
 _PAYMENT_DATE_RE = re.compile(
-    r"(?:(?:paid\s*on|transaction\s*date|payment\s*date|bill\s*date|invoice\s*date|\bdate)\s*[:.\-_]*\s*)"
-    r"(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}"
-    r"|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}"
+    r"(?:(?:paid\s*on|transaction\s*date|payment\s*date|bill\s*date|"
+    r"invoice\s*date|receipt\s*date|\bdate)\s*[:.\-_]*\s*)"
+    rf"({_NAMED_DATE_CAPTURE}"
+    r"|\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}"
     r"|\d{4}-\d{2}-\d{2})",
     re.IGNORECASE,
 )
@@ -1358,6 +1366,10 @@ def extract_textract_fields(
     if not total:
         total = _extract_total_from_text(text)
 
+    invoice_date = (expense.get("INVOICE_RECEIPT_DATE") or "").strip()
+    if not invoice_date:
+        invoice_date = demo.get("consultation_date") or ""
+
     provider = (expense.get("VENDOR_NAME") or "").strip()
     # Ignore truncated vendor tokens like "DrA"
     if provider and len(re.sub(r"[^A-Za-z]", "", provider)) < 4:
@@ -1376,6 +1388,9 @@ def extract_textract_fields(
         patient = ""
 
     payment = _extract_payment_fields(text)
+    # Clinic cash memo / OPD receipt: the printed Date is the transaction date.
+    if not (payment.get("transaction_date") or "").strip():
+        payment["transaction_date"] = invoice_date or demo.get("consultation_date") or ""
     # OPD pack with GPay screenshot: promote paid amount into bill total when missing.
     if not total and (payment.get("payment_amount") or "").strip():
         total = _normalize_amount(payment.get("payment_amount") or "")
@@ -1384,7 +1399,7 @@ def extract_textract_fields(
         "gst_number": gst,
         "drug_license_number": "; ".join(licenses) if licenses else "",
         "invoice_number": invoice_number,
-        "invoice_date": (expense.get("INVOICE_RECEIPT_DATE") or "").strip(),
+        "invoice_date": invoice_date,
         "total_amount": total,
         "provider_name": provider,
         "patient_name": patient,

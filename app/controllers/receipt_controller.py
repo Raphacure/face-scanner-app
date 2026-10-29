@@ -16,6 +16,7 @@ from app.services.classify_job_store import (
 from app.services.openai_document_classifier import (
     classify_document_url_openai,
     enrich_claim_batch_doctor_names,
+    enrich_claim_batch_transaction_dates,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,7 @@ def _run_classify_batch(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     indexed_results.sort(key=lambda item: item[0])
     results = [item[1] for item in indexed_results]
     enrich_claim_batch_doctor_names(results)
+    enrich_claim_batch_transaction_dates(results)
     return {
         "status": "success",
         "mode": "hybrid",
