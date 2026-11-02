@@ -30,6 +30,7 @@ from app.services.document_image_fetch import (
 from app.services.textract_ocr import (
     extract_textract_fields,
     fill_demographics_from_text,
+    is_usable_facility_name,
     merge_textract_into_openai_data,
     sync_patient_name_across_buckets,
 )
@@ -579,6 +580,11 @@ invoice_subtype: pharmacy | diagnostic | opd_consultation | dental | eye_care | 
 
 INVOICE: patient_*, invoice_number/date, provider_*, doctor_name, total_amount (digits only, primary total),
 payment_mode, transaction_reference, authorized_stamp/signature.
+provider_name: hospital / clinic / diagnostic-lab title on the letterhead or logo (top of the bill).
+If printed only in a regional script, transliterate to English
+(e.g. Telugu "శివ హాస్పిటల్స్" → "Shiva Hospitals"). Prefer English brand text when both exist.
+Never leave provider_name empty when a facility name is printed on the letterhead.
+Never use "Printed By", cashier, operator, or authorized-signatory names as provider_name.
 total_amount: read the primary billed/paid figure — "Total", "Grand Total", "Rs. 600/-", "₹600",
 "600/-" on cash memos, or the amount on an attached UPI/GPay screenshot. Digits only (600 not Rs. 600/-).
 Multi-page packs: page 1 may be Rx/OPD notes; the RECEIPT / fee amount is often on a later page — still fill total_amount.
@@ -679,10 +685,12 @@ Prescribed by / (Dr. Name) / Regn no are often at the bottom of a later page.
 Map visible labels onto the requested keys. Do not invent values.
 Dates as YYYY-MM-DD when possible. Signatures/stamps: "present" if visible but illegible.
 Handwritten vs computer_generated percents must sum to 100.
-doctor_name / clinic_hospital_name: read letterhead (top of page). If only a regional script is
-printed, transliterate to English (Tamil மருத்துவமனை/கிளினிக், Hindi अस्पताल/क्लिनिक, etc.).
+doctor_name / clinic_hospital_name / provider_name: read letterhead (top of page). If only a
+regional script is printed, transliterate to English (Telugu హాస్పిటల్స్, Tamil மருத்துவமனை/கிளினிக்,
+Hindi अस्पताल/क्लिनिक, etc.). Example: "శివ హాస్పిటల్స్" → "Shiva Hospitals".
 Prefer English logo/brand text when both exist (stacked logo lines like SRI + HOSPITALS count).
 Use "" only if truly not printed — never skip because the letterhead is non-Latin.
+Never use "Printed By" / cashier names as provider_name or clinic_hospital_name.
 invoice_number: Bill/Invoice/Receipt/Inv/Memo No, regional बिल/रसीद/पावती/क्रमांक labels, OR an
 unlabeled printed serial in the receipt header/top-right (common on OPD fee forms). That serial
 is invoice_number — do not leave it empty when visible.
@@ -958,14 +966,16 @@ def _ocr_is_weak(ocr: Optional[Dict[str, str]], category_hint: Optional[str] = N
     doctor = str(ocr.get("doctor_name") or "").strip()
     consult = str(ocr.get("consultation_date") or "").strip()
     total_amount = str(ocr.get("total_amount") or "").strip()
+    has_facility = is_usable_facility_name(facility)
     # Prescription/OPD: need vision if patient, hospital, or handwritten visit date missing.
     # Hospital pads often have strong printed OCR but a handwritten date above DATE ......
     if hint in {"prescription", "opd", ""}:
-        if not patient or not facility or not consult:
+        if not patient or not has_facility or not consult:
             return True
     elif hint == "invoice":
-        # OPD fee receipts often sit on page 2+ of Rx+receipt packs — amount must be present.
-        if not patient and not facility:
+        # Letterhead logos are often regional-script / decorative — attach the image
+        # whenever the hospital/lab name is still empty, even if patient + amount OCR'd.
+        if not has_facility:
             return True
         if not total_amount:
             return True
@@ -2129,6 +2139,9 @@ def _completeness(
 
 def _promote_field_aliases(params: Dict[str, Any]) -> None:
     """Fill empty twin fields from aliases so returned JSON and missing stay consistent."""
+    for key in ("clinic_hospital_name", "provider_name", "laboratory_name"):
+        if _str_val(params.get(key)) and not is_usable_facility_name(params.get(key)):
+            params[key] = ""
     facility = (
         _str_val(params.get("clinic_hospital_name"))
         or _str_val(params.get("provider_name"))
@@ -3868,8 +3881,16 @@ def _call_openai_vision(
                 "prescribed_medicines = medicine table rows [{medicine, dosage}]."
             )
         inv_note = ""
+        if "provider_name" in field_list:
+            inv_note += (
+                " PROVIDER NAME: hospital / clinic / diagnostic-lab title on the letterhead "
+                "or logo (top of bill). If printed only in Telugu/Tamil/Hindi/etc., "
+                "transliterate to English (e.g. శివ హాస్పిటల్స్ → \"Shiva Hospitals\"). "
+                "Never leave provider_name empty when that letterhead is visible. "
+                "Never use Printed By / cashier / authorized-signatory names as provider_name."
+            )
         if "patient_name" in field_list or "doctor_name" in field_list:
-            inv_note = (
+            inv_note += (
                 " CASH MEMO / PHARMACY: patient_name = handwritten name after "
                 "\"Prescribed for\" / Patient / Name / नाव; doctor_name = after \"By Dr\" / Doctor. "
                 "OPD Rx pads: patient_name = handwriting after printed \"Name :\" / "

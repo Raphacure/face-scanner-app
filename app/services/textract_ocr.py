@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import os
 
 from app.aws.textract_client import (
@@ -194,11 +194,124 @@ _SPLIT_HOSPITAL_LOGO_RE = re.compile(
     r"Institute(?:\s+of\s+Medical\s+Sciences)?)\b",
     re.IGNORECASE,
 )
-# Regional-script hospital words (Tamil/Hindi/etc.) — map to English when logo OCR fails.
-_REGIONAL_HOSPITAL_HINT_RE = re.compile(
-    r"(மருத்துவமனை|கிளினிக்|अस्पताल|हॉस्पिटल|क्लिनिक|"
-    r"హాస్పిటల్|క్లినిక్|ಆಸ್ಪತ್ರೆ|ആശുപത്രി|হাসপাতাল)",
+# Regional-script hospital words (longest first) — map to English when logo OCR fails.
+_REGIONAL_HOSPITAL_KIND: Tuple[Tuple[str, str], ...] = (
+    ("హాస్పిటల్స్", "Hospitals"),
+    ("హాస్పిటల్సు", "Hospitals"),
+    ("హాస్పిటల్", "Hospital"),
+    ("క్లినిక్", "Clinic"),
+    ("ఆసుపత్రి", "Hospital"),
+    ("மருத்துவமனை", "Hospital"),
+    ("கிளினிக்", "Clinic"),
+    ("अस्पताल", "Hospital"),
+    ("हॉस्पिटल", "Hospital"),
+    ("क्लिनिक", "Clinic"),
+    ("ಆಸ್ಪತ್ರೆ", "Hospital"),
+    ("ആശുപത്രി", "Hospital"),
+    ("হাসপাতাল", "Hospital"),
 )
+_REGIONAL_HOSPITAL_HINT_RE = re.compile(
+    "(" + "|".join(re.escape(token) for token, _ in _REGIONAL_HOSPITAL_KIND) + ")"
+)
+_GENERIC_FACILITY_NAMES = frozenset(
+    {
+        "hospital",
+        "hospitals",
+        "clinic",
+        "lab",
+        "laboratory",
+        "diagnostics",
+        "diagnostic",
+        "diagnostic lab",
+        "diagnostics lab",
+        "nursing home",
+    }
+)
+_FACILITY_FORM_HEADING_RE = re.compile(
+    r"\b(?:details?|particulars?|information)\b",
+    re.IGNORECASE,
+)
+_PRINTED_BY_RE = re.compile(r"^printed\s*by\b", re.IGNORECASE)
+# Telugu virama / vowel signs for letterhead transliteration (శివ → Shiva).
+_TELUGU_CONSONANTS = {
+    "క": "k",
+    "ఖ": "kh",
+    "గ": "g",
+    "ఘ": "gh",
+    "ఙ": "ng",
+    "చ": "ch",
+    "ఛ": "chh",
+    "జ": "j",
+    "ఝ": "jh",
+    "ఞ": "ny",
+    "ట": "t",
+    "ఠ": "th",
+    "డ": "d",
+    "ఢ": "dh",
+    "ణ": "n",
+    "త": "t",
+    "థ": "th",
+    "ద": "d",
+    "ధ": "dh",
+    "న": "n",
+    "ప": "p",
+    "ఫ": "ph",
+    "బ": "b",
+    "భ": "bh",
+    "మ": "m",
+    "య": "y",
+    "ర": "r",
+    "ఱ": "r",
+    "ల": "l",
+    "ళ": "l",
+    "వ": "v",
+    "శ": "sh",
+    "ష": "sh",
+    "స": "s",
+    "హ": "h",
+}
+_TELUGU_INDEPENDENT_VOWELS = {
+    "అ": "a",
+    "ఆ": "aa",
+    "ఇ": "i",
+    "ఈ": "ee",
+    "ఉ": "u",
+    "ఊ": "uu",
+    "ఋ": "ru",
+    "ఎ": "e",
+    "ఏ": "e",
+    "ఐ": "ai",
+    "ఒ": "o",
+    "ఓ": "o",
+    "ఔ": "au",
+}
+_TELUGU_VOWEL_SIGNS = {
+    "ా": "aa",
+    "ి": "i",
+    "ీ": "ee",
+    "ు": "u",
+    "ూ": "uu",
+    "ృ": "ru",
+    "ె": "e",
+    "ే": "e",
+    "ై": "ai",
+    "ొ": "o",
+    "ో": "o",
+    "ౌ": "au",
+}
+_TELUGU_VIRAMA = "్"
+_TELUGU_ANUSVARA = "ం"
+_TELUGU_VISARGA = "ః"
+_FACILITY_BRAND_ALIASES = {
+    "siva": "Shiva",
+    "shiva": "Shiva",
+}
+# Exact letterhead phrases we have seen on diagnostic bills.
+_KNOWN_REGIONAL_FACILITY_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"శివ\s*హాస్పిటల్(?:స్)?"), "Shiva Hospitals"),
+)
+
+
 def _compact_spaced_date_separators(text: str) -> str:
     """Turn clinic dates like '3. 10. 26' and '3,10,26' into '3.10.26'."""
     if not text:
@@ -252,10 +365,156 @@ _IOP_RE = re.compile(
 _VA_RE = re.compile(r"\bVA\s*:?\s*([^\n]{3,40})", re.IGNORECASE)
 
 
+def _known_regional_facility(text: str) -> str:
+    """Map known regional letterheads (శివ హాస్పిటల్స్ → Shiva Hospitals)."""
+    if not text:
+        return ""
+    compact = re.sub(r"\s+", " ", text)
+    for pattern, english in _KNOWN_REGIONAL_FACILITY_PATTERNS:
+        if pattern.search(compact) or pattern.search(text):
+            return english
+    return ""
+
+
+def _title_case_brand(brand: str) -> str:
+    cleaned = re.sub(r"\s+", " ", (brand or "").strip(" .,-|/"))
+    if not cleaned:
+        return ""
+    alias = _FACILITY_BRAND_ALIASES.get(cleaned.lower())
+    if alias:
+        return alias
+    return " ".join(
+        part[:1].upper() + part[1:].lower() if part else part
+        for part in cleaned.split(" ")
+    )
+
+
+def _transliterate_telugu(text: str) -> str:
+    """Best-effort Telugu → Latin for letterhead brands (శివ → shiva)."""
+    if not text:
+        return ""
+    out: List[str] = []
+    idx = 0
+    length = len(text)
+    while idx < length:
+        ch = text[idx]
+        if ch in " \t":
+            out.append(" ")
+            idx += 1
+            continue
+        if ch in _TELUGU_INDEPENDENT_VOWELS:
+            out.append(_TELUGU_INDEPENDENT_VOWELS[ch])
+            idx += 1
+            continue
+        if ch in _TELUGU_CONSONANTS:
+            cons = _TELUGU_CONSONANTS[ch]
+            nxt = text[idx + 1] if idx + 1 < length else ""
+            if nxt == _TELUGU_VIRAMA:
+                out.append(cons)
+                idx += 2
+                continue
+            if nxt in _TELUGU_VOWEL_SIGNS:
+                out.append(cons + _TELUGU_VOWEL_SIGNS[nxt])
+                idx += 2
+                continue
+            if nxt == _TELUGU_ANUSVARA:
+                out.append(cons + "am")
+                idx += 2
+                continue
+            out.append(cons + "a")
+            idx += 1
+            continue
+        if ch == _TELUGU_ANUSVARA:
+            out.append("m")
+            idx += 1
+            continue
+        if ch == _TELUGU_VISARGA:
+            out.append("h")
+            idx += 1
+            continue
+        if "\u0c00" <= ch <= "\u0c7f":
+            idx += 1
+            continue
+        if re.match(r"[A-Za-z0-9.&']", ch):
+            out.append(ch)
+        idx += 1
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
+
+def _regional_kind_english(token: str) -> str:
+    for script, english in _REGIONAL_HOSPITAL_KIND:
+        if token == script or token.startswith(script):
+            return english
+    return "Hospital"
+
+
+def is_usable_facility_name(val: Any) -> bool:
+    """True when a value can stand as hospital / lab / clinic provider_name."""
+    s = re.sub(r"\s+", " ", str(val or "")).strip(" .,-")
+    if not s:
+        return False
+    low = s.lower()
+    if low in _GENERIC_FACILITY_NAMES or _PRINTED_BY_RE.match(low):
+        return False
+    if _FACILITY_FORM_HEADING_RE.search(low) and re.search(
+        r"\b(?:lab|diagnostic|hospital|clinic)\b", low
+    ):
+        return False
+    latin = len(re.sub(r"[^A-Za-z]", "", s))
+    indic = bool(re.search(r"[\u0900-\u0D7F]", s))
+    if not indic and latin < 4:
+        return False
+    # "Printed By : Sudhakar Y" is a staff name, not the hospital.
+    tokens = s.split()
+    if (
+        len(tokens) == 2
+        and len(tokens[1]) == 1
+        and tokens[1].isalpha()
+        and not re.search(
+            r"\b(?:hospital|clinic|lab|laboratory|diagnostics?)\b", low
+        )
+    ):
+        return False
+    return True
+
+
+def _facility_brand_from_prefix(prefix: str, text: str, match_start: int) -> str:
+    """Latin or transliterated brand printed immediately before a hospital word."""
+    cleaned = re.sub(r"\s+", " ", (prefix or "")).strip(" .,-|:/")
+    if cleaned:
+        latin = re.findall(r"\b([A-Za-z][A-Za-z0-9.&']{1,24})\b", cleaned)
+        latin = [
+            tok
+            for tok in latin
+            if tok.lower() not in {"dr", "date", "name", "age", "regn", "reg", "the", "and"}
+        ]
+        if latin:
+            return _title_case_brand(latin[-1])
+        if re.search(r"[\u0c00-\u0c7f]", cleaned):
+            # Keep the last Telugu token (శివ హాస్పిటల్స్ → శివ).
+            telugu_tokens = [
+                tok for tok in re.split(r"\s+", cleaned) if re.search(r"[\u0c00-\u0c7f]", tok)
+            ]
+            if telugu_tokens:
+                brand = _title_case_brand(_transliterate_telugu(telugu_tokens[-1]))
+                if brand:
+                    return brand
+    window = text[max(0, match_start - 80) : match_start]
+    latin = re.findall(r"\b([A-Z][A-Za-z0-9.&']{1,20})\b", window)
+    if latin:
+        brand = latin[-1]
+        if brand.lower() not in {"dr", "date", "name", "age", "regn", "reg"}:
+            return _title_case_brand(brand)
+    return ""
+
+
 def _extract_hospital_title(text: str) -> str:
     """Letterhead hospital/clinic title from one line, split logo lines, or regional script."""
     if not text:
         return ""
+    known = _known_regional_facility(text)
+    if known:
+        return known
     # Prefer English logo split across lines (SRI\nHOSPITALS) — common on circular logos.
     split = _SPLIT_HOSPITAL_LOGO_RE.search(text)
     if split:
@@ -263,29 +522,74 @@ def _extract_hospital_title(text: str) -> str:
         kind = split.group(2).strip(" .,-")
         # Skip noise tokens that are not brand names.
         if brand and brand.lower() not in {"the", "and", "for", "dr", "born", "save"}:
-            return f"{brand} {kind}".strip()
+            title = f"{brand} {kind}".strip()
+            if is_usable_facility_name(title):
+                return title
     hm = _HOSPITAL_TITLE_RE.search(text)
     if hm:
-        return hm.group(1).strip(" .,-")
+        title = hm.group(1).strip(" .,-")
+        if is_usable_facility_name(title):
+            return title
     # Standalone HOSPITALS line with a short brand line immediately above.
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     for idx, line in enumerate(lines):
         if re.fullmatch(r"Hospitals?", line, re.IGNORECASE) and idx > 0:
             prev = lines[idx - 1]
             if re.fullmatch(r"[A-Za-z][A-Za-z0-9.&']{1,24}", prev):
-                return f"{prev} {line}"
-    # Regional script present but English OCR failed — still signal a hospital letterhead.
-    # Callers/OpenAI should prefer a proper English name; Textract may only see Tamil glyphs.
-    if _REGIONAL_HOSPITAL_HINT_RE.search(text):
-        # Try any nearby Latin brand token before the regional hospital word.
-        for m in _REGIONAL_HOSPITAL_HINT_RE.finditer(text):
-            window = text[max(0, m.start() - 80) : m.start()]
-            latin = re.findall(r"\b([A-Z][A-Za-z0-9.&']{1,20})\b", window)
-            if latin:
-                brand = latin[-1]
-                if brand.lower() not in {"dr", "date", "name", "age", "regn", "reg"}:
-                    return f"{brand} Hospital"
-        return "Hospital"
+                title = f"{prev} {line}"
+                if is_usable_facility_name(title):
+                    return title
+    # Regional script present but English OCR failed — transliterate the brand.
+    for m in _REGIONAL_HOSPITAL_HINT_RE.finditer(text):
+        kind = _regional_kind_english(m.group(1))
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        line_end = text.find("\n", m.end())
+        if line_end < 0:
+            line_end = len(text)
+        same_line = text[line_start:line_end]
+        known_line = _known_regional_facility(same_line)
+        if known_line:
+            return known_line
+        prefix = text[line_start : m.start()]
+        brand = _facility_brand_from_prefix(prefix, text, m.start())
+        if brand:
+            title = f"{brand} {kind}".strip()
+            if is_usable_facility_name(title):
+                return title
+        # Previous line may hold the Telugu/Latin brand (శివ\nహాస్పిటల్స్).
+        prev_nl = text.rfind("\n", 0, max(0, line_start - 1))
+        prev_line = text[prev_nl + 1 : line_start].strip() if line_start > 0 else ""
+        known_prev = _known_regional_facility(f"{prev_line} {same_line}")
+        if known_prev:
+            return known_prev
+        brand = _facility_brand_from_prefix(prev_line, text, m.start())
+        if brand:
+            title = f"{brand} {kind}".strip()
+            if is_usable_facility_name(title):
+                return title
+        # Keep the Telugu letterhead itself rather than dropping provider_name.
+        cleaned_line = same_line.strip(" .,-")
+        if is_usable_facility_name(cleaned_line) and len(cleaned_line) <= 80:
+            return cleaned_line
+    return ""
+
+
+def _normalize_vendor_name(raw: str) -> str:
+    """Keep real facility names; drop truncated Latin tokens and form headings."""
+    provider = re.sub(r"\s+", " ", (raw or "")).strip(" .,-")
+    if not provider:
+        return ""
+    known = _known_regional_facility(provider)
+    if known:
+        return known
+    if re.search(r"[\u0900-\u0D7F]", provider):
+        titled = _extract_hospital_title(provider)
+        if titled:
+            return titled
+        if is_usable_facility_name(provider):
+            return provider
+    if is_usable_facility_name(provider):
+        return provider
     return ""
 
 
@@ -836,7 +1140,7 @@ def _parse_demographics_from_lines(lines: List[str]) -> Dict[str, str]:
         facility = fm.group(1).strip() if fm else ""
     if not facility:
         facility = _extract_hospital_title(text)
-    if facility and len(facility) > 3:
+    if is_usable_facility_name(facility):
         # Skip doctor qualification lines mistaken as hospital titles.
         if not re.search(r"\b(?:M\.?B\.?B\.?S|F\.?C\.?C\.?M|F\.?D\.?M)\b", facility, re.I):
             if not re.search(r"\bnotes?/prescriptions?\b", facility, re.I):
@@ -1370,9 +1674,16 @@ def extract_textract_fields(
     if not invoice_date:
         invoice_date = demo.get("consultation_date") or ""
 
-    provider = (expense.get("VENDOR_NAME") or "").strip()
-    # Ignore truncated vendor tokens like "DrA"
-    if provider and len(re.sub(r"[^A-Za-z]", "", provider)) < 4:
+    provider = _normalize_vendor_name(expense.get("VENDOR_NAME") or "")
+    printed_by = ""
+    printed_m = re.search(
+        r"printed\s*by\s*[:.\-]*\s*([A-Za-z][A-Za-z .]{1,40})",
+        text,
+        re.IGNORECASE,
+    )
+    if printed_m:
+        printed_by = printed_m.group(1).strip(" .,-")
+    if printed_by and provider and provider.lower() == printed_by.lower():
         provider = ""
     patient = _clean_patient_name_value(demo.get("patient_name") or "")
     if not patient:
@@ -1382,6 +1693,16 @@ def extract_textract_fields(
                 patient = candidate
                 break
     clinic = (demo.get("clinic_hospital_name") or "").strip()
+    letterhead = _extract_hospital_title(text)
+    if is_usable_facility_name(letterhead):
+        if not is_usable_facility_name(clinic):
+            clinic = letterhead
+        if not is_usable_facility_name(provider):
+            provider = letterhead
+    if not is_usable_facility_name(clinic):
+        clinic = ""
+    if not is_usable_facility_name(provider) and clinic:
+        provider = clinic
     if patient and provider and patient.lower() == provider.lower():
         patient = ""
     if patient and clinic and patient.lower() == clinic.lower():
@@ -1596,6 +1917,8 @@ def fill_demographics_from_text(data: Dict[str, Any], text: str) -> None:
     demo = _parse_demographics_from_lines(text.splitlines())
     patient = _usable_patient_name(demo.get("patient_name"))
     clinic = str(demo.get("clinic_hospital_name") or "").strip()
+    if clinic and not is_usable_facility_name(clinic):
+        clinic = ""
     doctor = str(demo.get("doctor_name") or "").strip()
     age = str(demo.get("patient_age") or "").strip()
     gender = str(demo.get("patient_gender") or "").strip()
@@ -1755,6 +2078,8 @@ def merge_textract_into_openai_data(
             if _should_fill_patient(inv.get(key), ocr_val):
                 inv[key] = ocr_val
             continue
+        if key == "provider_name" and not is_usable_facility_name(ocr_val):
+            continue
         if _blank(inv.get(key)):
             inv[key] = ocr_val
 
@@ -1770,10 +2095,10 @@ def merge_textract_into_openai_data(
             existing_clinic = str(rx.get(key) or "").strip()
             junk_clinic = bool(
                 re.search(r"\bnotes?/prescriptions?\b", existing_clinic, re.I)
-            )
+            ) or not is_usable_facility_name(existing_clinic)
             if (
                 (_blank(existing_clinic) or junk_clinic)
-                and ocr_val
+                and is_usable_facility_name(ocr_val)
                 and not re.search(r"\bnotes?/prescriptions?\b", ocr_val, re.I)
             ):
                 rx[key] = ocr_val
@@ -1809,8 +2134,9 @@ def merge_textract_into_openai_data(
         inv["drug_license_number"] = ocr_dl
 
     # Map clinic → provider when invoice provider empty (Rx letterhead / OPD summary).
-    if _blank(inv.get("provider_name")) and not _blank(rx.get("clinic_hospital_name")):
-        inv["provider_name"] = rx.get("clinic_hospital_name")
+    clinic_name = str(rx.get("clinic_hospital_name") or "").strip()
+    if _blank(inv.get("provider_name")) and is_usable_facility_name(clinic_name):
+        inv["provider_name"] = clinic_name
 
     if inv:
         data["invoice_parameters"] = inv
