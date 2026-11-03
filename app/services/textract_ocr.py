@@ -136,8 +136,26 @@ _DEMOGRAPHICS_NAME_PREFIX_RE = re.compile(
     r"^(?:Patient(?:['’]?s)?\s+)?Name\s*[:.\-]",
     re.IGNORECASE,
 )
+# Allow single-letter surname initials ("vani p") after a real given name.
 _PERSON_NAME_LINE_RE = re.compile(
-    r"^[A-Za-z][A-Za-z.'\-]{1,30}(?:\s+[A-Za-z][A-Za-z.'\-]{1,30}){0,3}$"
+    r"^[A-Za-z][A-Za-z.'\-]{1,30}(?:\s+[A-Za-z][A-Za-z.'\-]{0,30}){0,3}$"
+)
+# Practo dental / HIS: "vani p (#ADH3606) , F" — name + patient id + gender on one line.
+_PRACTO_NAME_ID_GENDER_RE = re.compile(
+    r"^([A-Za-z][A-Za-z.'\-\s]{0,60}?)\s*"
+    r"\((?:P|MR|UHID|PID|ID|PT)?[\s#:\-]*[A-Z0-9\-]+\)\s*"
+    r"[,/\-]?\s*(male|female|[mf])\s*$",
+    re.IGNORECASE,
+)
+# Trailing gender marker after name/id (require separator so "John F" initials survive).
+_TRAILING_GENDER_RE = re.compile(
+    r"(?:\s*[,/\-]\s*(?:male|female|[mf])|\s+(?:male|female))\s*$",
+    re.IGNORECASE,
+)
+# Patient / MRN id in parentheses — not only at end-of-string.
+_PATIENT_ID_PAREN_RE = re.compile(
+    r"\s*\((?:P|MR|UHID|PID|ID|PT)?[\s#:\-]*[A-Z0-9\-]+\)",
+    re.IGNORECASE,
 )
 _HOSPITALISH_NAME_RE = re.compile(
     r"\b(?:hospital|clinic|pharmacy|medical\s+(?:store|centre|center)|"
@@ -362,7 +380,8 @@ _IOP_RE = re.compile(
     r"IOP\s*\(?\d*\)?\s*:?\s*(\d+)\s*(?:at\s*[^\n]*)?",
     re.IGNORECASE,
 )
-_VA_RE = re.compile(r"\bVA\s*:?\s*([^\n]{3,40})", re.IGNORECASE)
+# Require a VA token boundary so names like "vani" are not treated as visual acuity.
+_VA_RE = re.compile(r"\bVA\b\s*:?\s*([^\n]{3,40})", re.IGNORECASE)
 
 
 def _known_regional_facility(text: str) -> str:
@@ -836,13 +855,10 @@ def _clean_patient_name_value(raw: str) -> str:
     name = (raw or "").strip(" .:-")
     if not name:
         return ""
-    # Practo / HIS: "N. DURGA SHALINI (P38972)" — drop trailing patient/MRN id.
-    name = re.sub(
-        r"\s*\((?:P|MR|UHID|PID|ID|PT)?[\s#:\-]*[A-Z0-9\-]+\)\s*$",
-        "",
-        name,
-        flags=re.IGNORECASE,
-    ).strip(" .:-")
+    # Practo dental: "vani p (#ADH3606) , F" — drop ", F" / ", Female" before id strip.
+    name = _TRAILING_GENDER_RE.sub("", name).strip(" .:-")
+    # Practo / HIS: "N. DURGA SHALINI (P38972)" / "(#ADH3606)" — drop patient/MRN id.
+    name = _PATIENT_ID_PAREN_RE.sub("", name).strip(" .:-")
     name = _PATIENT_NAME_STOP_RE.sub("", name).strip(" .:-")
     # Reject non-name leftovers (dates, amounts, single tokens that are labels).
     if not name or re.fullmatch(r"[\d./\-]+", name):
@@ -867,10 +883,45 @@ def _looks_like_person_name(raw: str) -> bool:
     if not name or not _PERSON_NAME_LINE_RE.match(name):
         return False
     tokens = name.split()
-    # Prefer multi-token Indian names; allow long single tokens (e.g. "Susheela").
-    if len(tokens) == 1 and len(tokens[0]) < 5:
+    # Prefer multi-token Indian names; allow short given names (e.g. "vani", "Ravi").
+    if len(tokens) == 1 and len(tokens[0]) < 4:
         return False
     return True
+
+
+def _orphan_patient_name_practo_id_gender(lines: List[str]) -> Tuple[str, str]:
+    """Practo dental invoices: unlabeled 'Name (#ID) , F' on one line → (name, gender)."""
+    for line in lines:
+        raw = line.strip()
+        if not raw:
+            continue
+        m = _PRACTO_NAME_ID_GENDER_RE.match(raw)
+        if not m:
+            # Same pattern after cleaning (OCR may split punctuation oddly).
+            cleaned = _clean_patient_name_value(raw)
+            if cleaned and _looks_like_person_name(cleaned) and (
+                _PATIENT_ID_PAREN_RE.search(raw) and _TRAILING_GENDER_RE.search(raw)
+            ):
+                gender_m = re.search(
+                    r"[,/\-]?\s*(male|female|[mf])\s*$", raw, re.IGNORECASE
+                )
+                g = (gender_m.group(1) if gender_m else "").strip().upper()
+                gender = (
+                    "F"
+                    if g.startswith("F")
+                    else "M"
+                    if g.startswith("M")
+                    else ""
+                )
+                return cleaned, gender
+            continue
+        cleaned = _clean_patient_name_value(m.group(1))
+        if not cleaned or not _looks_like_person_name(cleaned):
+            continue
+        g = m.group(2).strip().upper()
+        gender = "F" if g.startswith("F") else "M" if g.startswith("M") else ""
+        return cleaned, gender
+    return "", ""
 
 
 def _orphan_patient_name_near_demographics(lines: List[str]) -> str:
@@ -1114,6 +1165,13 @@ def _parse_demographics_from_lines(lines: List[str]) -> Dict[str, str]:
         patient = _orphan_patient_name_near_demographics(lines)
     if not patient:
         patient = _orphan_patient_name_near_gender_age(lines)
+    if not patient:
+        # Practo dental / HIS: "vani p (#ADH3606) , F" (name+id+gender, one line).
+        practo_name, practo_gender = _orphan_patient_name_practo_id_gender(lines)
+        if practo_name:
+            patient = practo_name
+            if practo_gender and not out["patient_gender"]:
+                out["patient_gender"] = practo_gender
     if patient:
         patient = _append_patient_name_continuation(lines, patient)
         out["patient_name"] = patient
