@@ -600,6 +600,9 @@ when "Prescribed for" has a handwritten name. Regional patient labels (नाव
 patient_name; date labels (दिनांक / Date) to invoice_date.
 Practo / HIS OPD payment receipts: patient_name is often unlabeled — the bold person name
 above "Female/Male, N Years" (may include "(P38972)" patient id — strip the id, keep the name).
+Practo dental / clinic invoices: unlabeled same-line "vani p (#ADH3606) , F" (name + patient id
++ gender, often no age) IS patient_name — strip "(#ADH…)" / "(P…)" and trailing ", F"/", M";
+keep the name (including short names and surname initials). Set patient_gender from that marker.
 doctor_name may appear only in line items as "Consultation by Dr SRAVYA" — extract "Dr SRAVYA".
 Do not leave patient_name or doctor_name empty when those patterns are visible.
 Pharmacy: drug_license_number (all DL lines, join "; "); medicine_details[] "name | Qty | Rate | Batch | Exp".
@@ -701,7 +704,9 @@ line has a handwritten name — even if Age/Sex is blank. Never use the doctor o
 consultation_date on OPD/hospital pads: handwritten date on/above/beside printed "DATE" /
 "DATE........" (e.g. 22/9/26) — normalize YYYY-MM-DD; do not leave empty when visible.
 Practo / HIS OPD invoices: unlabeled person name above "Female/Male, N Years" IS patient_name
-(strip "(P…)" / MRN suffixes). "Consultation by Dr NAME" in Treatments IS doctor_name.
+(strip "(P…)" / MRN suffixes). Practo dental invoices often print name+id+gender on one line —
+e.g. "vani p (#ADH3606) , F" — that IS patient_name (strip id + ", F"/", M"; keep short names /
+initials) and patient_gender. "Consultation by Dr NAME" in Treatments IS doctor_name.
 Do not confuse "Prescribed for" (patient) with "By Dr" (doctor). Use "" only when truly absent.
 Text fields use "" when absent — never "present" (only doctor_signature / doctor_stamp use "present").
 """
@@ -3896,8 +3901,9 @@ def _call_openai_vision(
                 "OPD Rx pads: patient_name = handwriting after printed \"Name :\" / "
                 "\"Patient Name :\" / \"Patient :\". "
                 "PRACTO / HIS OPD PAYMENT: unlabeled person name above \"Female/Male, N Years\" "
-                "IS patient_name (strip \"(P…)\" ids); \"Consultation by Dr NAME\" in Treatments "
-                "IS doctor_name. Fill both when visible."
+                "IS patient_name (strip \"(P…)\" ids); Practo dental same-line "
+                "\"Name (#ADH…) , F\" IS patient_name (strip id + gender marker) and patient_gender; "
+                "\"Consultation by Dr NAME\" in Treatments IS doctor_name. Fill both when visible."
             )
         if "invoice_number" in field_list:
             inv_note += (
