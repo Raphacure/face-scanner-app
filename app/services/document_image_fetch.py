@@ -12,7 +12,7 @@ import requests
 MAX_DOWNLOAD_BYTES = 15 * 1024 * 1024
 MAX_RENDERED_PAGE_BYTES = 5 * 1024 * 1024
 # Hard ceiling for rendered/OCR'd PDF pages (claim packs: Rx + bills + UPI + labs).
-MAX_PDF_PAGES = 10
+MAX_PDF_PAGES = 15
 REQUEST_TIMEOUT_S = 60
 _VALID_IMAGE_DETAIL = frozenset({"auto", "low", "high"})
 
@@ -291,7 +291,7 @@ def download_image_data_url(url: str) -> Tuple[str, bytes]:
 
 
 def build_vision_image_blocks(url: str) -> Tuple[List[Dict[str, Any]], bytes]:
-    """OpenAI Vision blocks — PDFs limited to PDF_VISION_MAX_PAGES (default/cap 10)."""
+    """OpenAI Vision blocks — PDFs limited to PDF_VISION_MAX_PAGES (default/cap 15)."""
     doc = load_document(url)
     detail = _vision_image_detail()
     limit = pdf_vision_max_pages() if doc.is_pdf else len(doc.page_images)
