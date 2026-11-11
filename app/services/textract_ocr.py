@@ -83,7 +83,7 @@ _RECEIPT_AMOUNT_CUE_RE = re.compile(
     re.IGNORECASE,
 )
 # Cap multi-page sync OCR (keep in sync with document_image_fetch.MAX_PDF_PAGES).
-_TEXTRACT_MAX_PAGES = 10
+_TEXTRACT_MAX_PAGES = 15
 # Age then gender: "25 Years / Female". Gender then age (Practo): "Female, 25 Years".
 _AGE_SEX_RE = re.compile(
     r"(?:"
