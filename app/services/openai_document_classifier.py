@@ -637,7 +637,11 @@ consultation_date (OPD/hospital pads): read the handwritten date on/above/beside
 consultation_date empty when that handwriting is visible — even if the printed DATE line has only dots.
 Normalize to YYYY-MM-DD (2-digit years → 20xx). Never use DOB as consultation_date.
 doctor_name: from letterhead or Prescribed by. Transliterate regional scripts to English when visible.
-Use "" if the name is not printed or not readable — plain text only, no placeholders.
+Clinic/nursing-home pads often print one or more doctors with qualifications (e.g.
+"Dr. First Last, M.B.B.S., M.D … Reg. No. 12345") in the header —
+that IS doctor_name even with no signature and no "Prescribed by" / "By Dr" line.
+If multiple doctors are listed, use the first/top-listed name (and their Reg No).
+Use "" only if no Dr. name is printed or readable — plain text only, no placeholders.
 clinic_hospital_name: from letterhead logo / hospital title (top of Rx). If printed only in a
 regional script, transliterate to English. Prefer English brand/logo text when both are present
 (e.g. Tamil "ஸ்ரீ மருத்துவமனை" + logo "SRI HOSPITALS" → "SRI HOSPITALS").
@@ -692,6 +696,9 @@ doctor_name / clinic_hospital_name / provider_name: read letterhead (top of page
 regional script is printed, transliterate to English (Telugu హాస్పిటల్స్, Tamil மருத்துவமனை/கிளினிக்,
 Hindi अस्पताल/क्लिनिक, etc.). Example: "శివ హాస్పిటల్స్" → "Shiva Hospitals".
 Prefer English logo/brand text when both exist (stacked logo lines like SRI + HOSPITALS count).
+doctor_name on OPD/clinic pads: printed "Dr. Name, M.B.B.S/M.D/…" on the letterhead counts —
+even when two doctors are listed and there is no signature / "Prescribed by". Take the
+first/top-listed doctor. Never leave doctor_name empty when any letterhead Dr. name is printed.
 Use "" only if truly not printed — never skip because the letterhead is non-Latin.
 Never use "Printed By" / cashier names as provider_name or clinic_hospital_name.
 invoice_number: Bill/Invoice/Receipt/Inv/Memo No, regional बिल/रसीद/पावती/क्रमांक labels, OR an
@@ -760,10 +767,13 @@ DOCTOR_REG_SCHEMA: Dict[str, Any] = {
 }
 
 DOCTOR_REG_PROMPT = """Extract letterhead doctor_name, clinic_hospital_name, and doctor_registration_number.
-doctor_name: full printed name; transliterate regional scripts to English. Use "" if not found.
+doctor_name: full printed name on letterhead (e.g. "Dr. First Last");
+transliterate regional scripts to English. If multiple doctors are listed with qualifications /
+Reg No, use the first/top-listed doctor — do not leave empty. Use "" only if no Dr. name is printed.
 clinic_hospital_name: hospital/clinic title on letterhead or logo; transliterate regional scripts to
 English (prefer English brand text when printed). Use "" if not found.
-doctor_registration_number: from stamp/signature area (CN No, Reg No, Regd No, RMC, MCI, MMC, HPMC) — number only.
+doctor_registration_number: Reg No next to that letterhead doctor, or from stamp/signature
+(CN No, Reg No, Regd No, RMC, MCI, MMC, HPMC) — number only.
 Do NOT return CR No, Patient Registration, Token No, Room No, Mobile, Fee amounts, or barcodes.
 doctor_stamp: "present" if a stamp/seal is visible (even if text is faint), else ""."""
 
@@ -3880,8 +3890,11 @@ def _call_openai_vision(
                 " RX LETTERHEAD: clinic_hospital_name = hospital/clinic title or logo "
                 "(transliterate regional scripts to English; prefer English brand if present; "
                 "stacked logo text like SRI + HOSPITALS → \"SRI HOSPITALS\"); "
-                "doctor_name = full printed name or \"\"; "
-                "doctor_registration_number = Regn no / Reg No / WBMC/MCI (number only); "
+                "doctor_name = full printed letterhead Dr. name (first/top-listed if several "
+                "doctors with M.B.B.S/M.D/Reg No are printed) — valid even with no signature "
+                "or \"Prescribed by\"; use \"\" only if no Dr. name is printed; "
+                "doctor_registration_number = that doctor's Regn no / Reg No / WBMC/MCI "
+                "(number only); "
                 "doctor_signature = \"present\" if a handwritten signature is visible; "
                 "prescribed_medicines = medicine table rows [{medicine, dosage}]."
             )
@@ -4021,8 +4034,11 @@ def _refine_doctor_registration_stamp(
         (
             "Zoomed letterhead and bottom / signature-zone crops of a prescription or OPD card. "
             "Find clinic_hospital_name and doctor_name on the letterhead "
-            "(transliterate regional scripts to English; use English logo text when present) and "
-            "CN No / Reg No on or under the doctor stamp or signature. Ignore CR No / Token / Mobile."
+            "(transliterate regional scripts to English; use English logo text when present). "
+            "Printed letterhead doctors with qualifications/Reg No count even without a signature; "
+            "if multiple are listed, take the first/top-listed name and their Reg No. "
+            "Also read CN No / Reg No on or under the doctor stamp or signature. "
+            "Ignore CR No / Token / Mobile."
         ),
         crop_blocks,
         "doctor_registration_stamp_extraction",

@@ -192,6 +192,23 @@ _BY_DR_RE = re.compile(
     r"[\d,]+\.?\d*|₹|Rs\.?|INR|$|\n))",
     re.IGNORECASE,
 )
+# Clinic pad letterhead: "Dr. First Last, M.B.B.S., … Reg. No. 12345."
+# Prefer lines anchored by qualifications / Reg No so body "Dr" notes are skipped.
+_LETTERHEAD_DR_QUAL_RE = re.compile(
+    r"M\.?\s*B\.?\s*B\.?\s*S|M\.?\s*D\.?\b|M\.?\s*S\.?\b|B\.?\s*D\.?\s*S|"
+    r"D\.?\s*M\.?\b|DNB|FRCS|MRCP|Dip\.?\s|Reg\.?\s*No|Regd\.?\s*No|"
+    r"Physician|Gynaec|Gynec|Surgeon|Consultant|Obstetric|Ortho|Cardio|Diabet",
+    re.IGNORECASE,
+)
+_LETTERHEAD_DR_NAME_RE = re.compile(
+    r"(Dr\.?\s+[A-Za-z][A-Za-z.'\-]{1,40}(?:\s+[A-Za-z][A-Za-z.'\-]{0,40}){0,5})",
+    re.IGNORECASE,
+)
+_LETTERHEAD_DR_REG_RE = re.compile(
+    r"(?:Reg\.?\s*No\.?|Regd\.?\s*No\.?|Regn\.?\s*No\.?)\s*[:\-]?\s*"
+    r"([A-Za-z0-9][A-Za-z0-9/\-]{3,20})",
+    re.IGNORECASE,
+)
 _FACILITY_LINE_RE = re.compile(
     r"(?:^|\n)\s*Facility\s*[:\-]?\s*([^\n]{3,80})",
     re.IGNORECASE,
@@ -1108,6 +1125,52 @@ def _append_patient_name_continuation(lines: List[str], patient: str) -> str:
     return base
 
 
+def _clean_letterhead_doctor_name(raw_name: str) -> str:
+    name = re.sub(r"\s+", " ", (raw_name or "")).strip(" .,;:")
+    name = re.split(
+        r"\s*,\s*|\s+(?=M\.?\s*B\.?\s*B\.?\s*S|M\.?\s*D\b|M\.?\s*S\b|B\.?\s*D)",
+        name,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip(" .,;:")
+    core = re.sub(r"^dr\.?\s*", "", name, flags=re.I).strip()
+    if len(core) < 3:
+        return ""
+    if re.search(r"\b(?:inj|tab|syp|cap|dose)\b", name, re.I):
+        return ""
+    if not name.lower().startswith("dr"):
+        name = f"Dr. {name}"
+    return name
+
+
+def _extract_letterhead_doctor(text: str) -> Tuple[str, str]:
+    """First printed letterhead doctor name + Reg No (multi-doctor pads OK)."""
+    if not (text or "").strip():
+        return "", ""
+    # Prefer early letterhead (top ~40 lines) over body notes.
+    head_lines = [ln.strip() for ln in text.splitlines()[:40] if ln.strip()]
+    for idx, raw in enumerate(head_lines):
+        if not re.search(r"\bDr\.?\b", raw, re.IGNORECASE):
+            continue
+        nxt = head_lines[idx + 1] if idx + 1 < len(head_lines) else ""
+        # Same-line quals, or OCR split: "Dr. Name" then "M.B.B.S. … Reg. No."
+        window = raw if _LETTERHEAD_DR_QUAL_RE.search(raw) else f"{raw} {nxt}".strip()
+        if not _LETTERHEAD_DR_QUAL_RE.search(window):
+            continue
+        name_m = _LETTERHEAD_DR_NAME_RE.search(raw)
+        if not name_m:
+            continue
+        name = _clean_letterhead_doctor_name(name_m.group(1))
+        if not name:
+            continue
+        reg = ""
+        reg_m = _LETTERHEAD_DR_REG_RE.search(window)
+        if reg_m:
+            reg = reg_m.group(1).strip()
+        return name, reg
+    return "", ""
+
+
 def _parse_demographics_from_lines(lines: List[str]) -> Dict[str, str]:
     text = "\n".join(lines)
     out: Dict[str, str] = {
@@ -1115,6 +1178,7 @@ def _parse_demographics_from_lines(lines: List[str]) -> Dict[str, str]:
         "patient_age": "",
         "patient_gender": "",
         "doctor_name": "",
+        "doctor_registration_number": "",
         "clinic_hospital_name": "",
         "consultation_date": "",
         "diagnosis": "",
@@ -1182,8 +1246,15 @@ def _parse_demographics_from_lines(lines: List[str]) -> Dict[str, str]:
     if not doctor:
         dm = _BY_DR_RE.search(text) or _DOCTOR_LINE_RE.search(text)
         doctor = dm.group(1).strip(" .") if dm else ""
+    letterhead_doctor, letterhead_reg = _extract_letterhead_doctor(text)
     if doctor and len(doctor) > 3:
         out["doctor_name"] = doctor
+    elif letterhead_doctor:
+        # Valid: clinic pads list Dr. Name + qualifications on letterhead with no
+        # "By Dr" / signature line — take the first / top-listed doctor.
+        out["doctor_name"] = letterhead_doctor
+    if letterhead_reg:
+        out["doctor_registration_number"] = letterhead_reg
 
     facility = _value_after_label(lines, ["Facility", "Hospital", "Clinic"])
     if facility and (
@@ -1587,6 +1658,7 @@ _EMPTY_OCR: Dict[str, str] = {
     "patient_age": "",
     "patient_gender": "",
     "doctor_name": "",
+    "doctor_registration_number": "",
     "clinic_hospital_name": "",
     "consultation_date": "",
     "diagnosis": "",
@@ -1786,6 +1858,7 @@ def extract_textract_fields(
         "patient_age": demo.get("patient_age") or "",
         "patient_gender": demo.get("patient_gender") or "",
         "doctor_name": demo.get("doctor_name") or "",
+        "doctor_registration_number": demo.get("doctor_registration_number") or "",
         "clinic_hospital_name": demo.get("clinic_hospital_name") or "",
         "consultation_date": demo.get("consultation_date") or "",
         "diagnosis": demo.get("diagnosis") or "",
@@ -1978,6 +2051,7 @@ def fill_demographics_from_text(data: Dict[str, Any], text: str) -> None:
     if clinic and not is_usable_facility_name(clinic):
         clinic = ""
     doctor = str(demo.get("doctor_name") or "").strip()
+    doctor_reg = str(demo.get("doctor_registration_number") or "").strip()
     age = str(demo.get("patient_age") or "").strip()
     gender = str(demo.get("patient_gender") or "").strip()
     consult = str(demo.get("consultation_date") or "").strip()
@@ -2025,6 +2099,9 @@ def fill_demographics_from_text(data: Dict[str, Any], text: str) -> None:
             bucket["laboratory_name"] = clinic
         if doctor and _blank(bucket.get("doctor_name")):
             bucket["doctor_name"] = doctor
+        if doctor_reg and _blank(bucket.get("doctor_registration_number")):
+            if key in ("parameters", "prescription_parameters", "invoice_parameters"):
+                bucket["doctor_registration_number"] = doctor_reg
         if age and _blank(bucket.get("patient_age")):
             bucket["patient_age"] = age
         if gender and _blank(bucket.get("patient_gender")):
@@ -2093,6 +2170,7 @@ def merge_textract_into_openai_data(
         "patient_age",
         "patient_gender",
         "doctor_name",
+        "doctor_registration_number",
         "provider_contact",
     )
     rx_fill_keys = (
@@ -2100,6 +2178,7 @@ def merge_textract_into_openai_data(
         "patient_age",
         "patient_gender",
         "doctor_name",
+        "doctor_registration_number",
         "clinic_hospital_name",
         "consultation_date",
         "diagnosis",
